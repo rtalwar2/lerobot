@@ -113,6 +113,7 @@ class DiffusionConfig(PreTrainedConfig):
             "VISUAL": NormalizationMode.MEAN_STD,
             "STATE": NormalizationMode.MIN_MAX,
             "ACTION": NormalizationMode.MIN_MAX,
+            "AUDIO": NormalizationMode.IDENTITY
         }
     )
 
@@ -129,6 +130,22 @@ class DiffusionConfig(PreTrainedConfig):
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
+
+
+    # --- NEW: Audio / AST Configuration ---
+    # Name of the HuggingFace checkpoint
+    audio_backbone: str | None = "MIT/ast-finetuned-audioset-10-10-0.4593" 
+    # Provided by your training script
+    audio_norm_mean: float = 0.0 
+    audio_norm_std: float = 1.0
+    # If "embedding", we use the AST CLS token/Pooler (768 dim).
+    # If "classifier", we add a head to predict logits (num_audio_classes dim).
+    audio_feature_type: str = "embedding" 
+    # num_audio_classes: int = 2 #this will always be frozen from pretrained model
+    time_dimension:int = 298
+    freeze_audio_encoder:bool = True
+    # --------------------------------------
+    
     # Unet.
     down_dims: tuple[int, ...] = (512, 1024, 2048)
     kernel_size: int = 5
@@ -167,6 +184,9 @@ class DiffusionConfig(PreTrainedConfig):
             raise ValueError(
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
             )
+        
+        if self.audio_feature_type not in ["embedding", "classifier"]:
+            raise ValueError("audio_feature_type must be 'embedding' or 'classifier'")
 
         supported_prediction_types = ["epsilon", "sample"]
         if self.prediction_type not in supported_prediction_types:

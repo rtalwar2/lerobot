@@ -334,7 +334,12 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         batch = next(dl_iter)
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
-
+        state = batch["observation.state"]
+        action = batch["action"]
+        if state.ndim == 2:
+            batch["observation.state"] = batch["observation.state"].unsqueeze(-1)
+        if action.ndim == 2:
+            batch["action"] = batch["action"].unsqueeze(-1)
         train_tracker, output_dict = update_policy(
             train_tracker,
             policy,

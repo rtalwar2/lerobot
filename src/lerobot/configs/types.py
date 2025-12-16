@@ -20,6 +20,7 @@ from enum import Enum
 class FeatureType(str, Enum):
     STATE = "STATE"
     VISUAL = "VISUAL"
+    AUDIO = "AUDIO"
     ENV = "ENV"
     ACTION = "ACTION"
     REWARD = "REWARD"
@@ -33,8 +34,8 @@ class PipelineFeatureType(str, Enum):
 
 class NormalizationMode(str, Enum):
     MIN_MAX = "MIN_MAX"
-    MEAN_STD = "MEAN_STD"
     IDENTITY = "IDENTITY"
+    MEAN_STD = "MEAN_STD"
     QUANTILES = "QUANTILES"
     QUANTILE10 = "QUANTILE10"
 

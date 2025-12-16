@@ -42,7 +42,10 @@ from lerobot.policies.utils import (
     populate_queues,
 )
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+from transformers import ASTForAudioClassification, AutoConfig, ASTModel
 
+# Define the key for your spectrogram
+OBS_AUDIO = "observation.audio.spectogram_values"
 
 class DiffusionPolicy(PreTrainedPolicy):
     """
@@ -89,6 +92,14 @@ class DiffusionPolicy(PreTrainedPolicy):
         if self.config.env_state_feature:
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
 
+        # --- NEW: Initialize Audio Queue ---
+        # Check if the audio key exists in the input features map 
+        # (Assuming the dataset provides this key)
+        # In LeRobot, features are usually inferred from dataset stats, 
+        # so we check if the key exists in the config's input features implicitly
+        # or simply initialize it if we expect audio.
+        self._queues[OBS_AUDIO] = deque(maxlen=self.config.n_obs_steps)
+
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """Predict a chunk of actions given environment observations."""
@@ -128,6 +139,7 @@ class DiffusionPolicy(PreTrainedPolicy):
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         # NOTE: It's important that this happens after stacking the images into a single key.
+        # Populate queues (this handles OBS_AUDIO if it's in the batch)
         self._queues = populate_queues(self._queues, batch)
 
         if len(self._queues[ACTION]) == 0:
@@ -164,9 +176,12 @@ class DiffusionModel(nn.Module):
     def __init__(self, config: DiffusionConfig):
         super().__init__()
         self.config = config
-
+        
+        # --- 1. Robot State ---
         # Build observation encoders (depending on which observations are provided).
         global_cond_dim = self.config.robot_state_feature.shape[0]
+        
+        # --- 2. Images ---
         if self.config.image_features:
             num_images = len(self.config.image_features)
             if self.config.use_separate_rgb_encoder_per_camera:
@@ -176,11 +191,21 @@ class DiffusionModel(nn.Module):
             else:
                 self.rgb_encoder = DiffusionRgbEncoder(config)
                 global_cond_dim += self.rgb_encoder.feature_dim * num_images
+        # --- 3. Env State ---
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
+            
+        # --- 4. NEW: Audio / Spectrogram ---
+        # We detect if we need audio encoder based on config or feature presence
+        self.use_audio = getattr(config, "audio_backbone", None) is not None
+        if self.use_audio:
+            self.audio_encoder = DiffusionAudioEncoder(config)
+            global_cond_dim += self.audio_encoder.feature_dim
 
+        # U-Net
         self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
 
+        # Scheduler
         self.noise_scheduler = _make_noise_scheduler(
             config.noise_scheduler_type,
             num_train_timesteps=config.num_train_timesteps,
@@ -237,7 +262,10 @@ class DiffusionModel(nn.Module):
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         """Encode image features and concatenate them all together along with the state vector."""
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
+        # 1. State
         global_cond_feats = [batch[OBS_STATE]]
+
+        # 2. Images
         # Extract image features.
         if self.config.image_features:
             if self.config.use_separate_rgb_encoder_per_camera:
@@ -266,8 +294,24 @@ class DiffusionModel(nn.Module):
                 )
             global_cond_feats.append(img_features)
 
+        # 3. Env State
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV_STATE])
+
+        # 4. NEW: Audio
+        if self.use_audio and OBS_AUDIO in batch:
+            # batch[OBS_AUDIO] shape: (B, S, Time, Freq)
+            # Flatten B and S
+            # torch.Size([32, 2, 3, 298, 128])
+            batch[OBS_AUDIO] = batch[OBS_AUDIO][:,:,0]
+            audio_input = einops.rearrange(batch[OBS_AUDIO], "b s t f -> (b s) t f")
+            
+            # Pass through AST
+            audio_feats = self.audio_encoder(audio_input)
+            
+            # Reshape back to (B, S, Dim)
+            audio_feats = einops.rearrange(audio_feats, "(b s) d -> b s d", b=batch_size, s=n_obs_steps)
+            global_cond_feats.append(audio_feats)
 
         # Concatenate features then flatten to (B, global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
@@ -320,7 +364,6 @@ class DiffusionModel(nn.Module):
         horizon = batch[ACTION].shape[1]
         assert horizon == self.config.horizon
         assert n_obs_steps == self.config.n_obs_steps
-
         # Encode image features and concatenate them all together along with the state vector.
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
@@ -365,6 +408,83 @@ class DiffusionModel(nn.Module):
         return loss.mean()
 
 
+# --- NEW CLASS: DiffusionAudioEncoder ---
+
+class DiffusionAudioEncoder(nn.Module):
+    """
+    Encodes audio spectrograms using an AST backbone.
+    Supports returning raw embeddings or classification logits (pseudoinstrumentation).
+    """
+    def __init__(self, config: DiffusionConfig):
+        super().__init__()
+        self.config = config
+        
+        # Load Config first to set max_length correctly before model init
+        # This is critical for resizing positional embeddings
+        hf_config = AutoConfig.from_pretrained(config.audio_backbone)
+        hf_config.max_length = config.time_dimension #298
+        
+        
+        if config.audio_feature_type == "classifier":
+            self.feature_dim = hf_config.num_labels      
+            self.backbone = ASTForAudioClassification.from_pretrained(
+            config.audio_backbone,
+            config=hf_config,
+            ignore_mismatched_sizes=False,  # Rescales positional embeddings for 300-frame spectrograms
+            )
+        elif config.audio_feature_type == "embedding":
+            self.feature_dim = hf_config.hidden_size
+            self.backbone = ASTModel.from_pretrained(
+            config.audio_backbone,
+            config=hf_config,
+            ignore_mismatched_sizes=True,  # Rescales positional embeddings for 300-frame spectrograms
+            )
+
+        self.mean = config.audio_norm_mean
+        self.std = config.audio_norm_std
+        
+        # 4. Freezing Logic (As requested)
+        # Default to True (Frozen) if not specified in config
+        if getattr(config, "freeze_audio_encoder", True):
+            self.backbone.requires_grad_(False)
+            print(f"Audio Encoder ({config.audio_feature_type}) is FROZEN.")
+        else:
+            self.backbone.requires_grad_(True)
+            print(f"Audio Encoder ({config.audio_feature_type}) is TRAINING (End-to-End).")
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: (B, Time, Freq) Spectrogram tensor.
+        Returns:
+            (B, D) Audio feature (embedding or logits).
+        """
+        # 1. Normalize (AST specific normalization from your script)
+        # formula: (x - mean) / (std * 2)
+        x = (x - self.mean) / (self.std * 2.0)
+        
+        # 2. Forward pass through AST
+        # AST expects inputs of shape (batch_size, max_length, num_mel_bins)
+        # It handles the patch embedding internally.
+        outputs = self.backbone(input_values=x)
+        if self.config.audio_feature_type == "classifier":
+            return outputs.logits
+        elif self.config.audio_feature_type == "embedding":
+            return outputs.pooler_output
+        
+        # # 3. Get Pooling output (CLS token usually)
+        # # pooler_output shape: (B, 768)
+        # embeddings = outputs.pooler_output
+        
+        # # 4. Optional Classifier
+        # if self.head is not None:
+        #     # Experiment: Pseudoinstrumentation (return logits)
+        #     return self.head(embeddings)
+        # else:
+        #     # Experiment: Raw Embeddings
+        #     return embeddings
+
+        
 class SpatialSoftmax(nn.Module):
     """
     Spatial Soft Argmax operation described in "Deep Spatial Autoencoders for Visuomotor Learning" by Finn et al.
