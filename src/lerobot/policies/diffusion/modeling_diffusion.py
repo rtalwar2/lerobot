@@ -105,9 +105,13 @@ class DiffusionPolicy(PreTrainedPolicy):
         """Predict a chunk of actions given environment observations."""
         # stack n latest observations from the queue
         batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
-        actions = self.diffusion.generate_actions(batch, noise=noise)
+        # capture the images used for prediction
+        if "observation.images" in batch:
+            used_images = batch["observation.images"]
 
-        return actions
+        actions, attn_maps = self.diffusion.generate_actions(batch, noise=noise)
+
+        return actions, used_images, attn_maps
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
@@ -131,6 +135,8 @@ class DiffusionPolicy(PreTrainedPolicy):
         "horizon" may not the best name to describe what the variable actually means, because this period is
         actually measured from the first observation which (if `n_obs_steps` > 1) happened in the past.
         """
+        used_images = None  # default
+        attn_maps = None
         # NOTE: for offline evaluation, we have action in the batch, so we need to pop it out
         if ACTION in batch:
             batch.pop(ACTION)
@@ -143,11 +149,11 @@ class DiffusionPolicy(PreTrainedPolicy):
         self._queues = populate_queues(self._queues, batch)
 
         if len(self._queues[ACTION]) == 0:
-            actions = self.predict_action_chunk(batch, noise=noise)
+            actions ,used_images, attn_maps = self.predict_action_chunk(batch, noise=noise)
             self._queues[ACTION].extend(actions.transpose(0, 1))
 
         action = self._queues[ACTION].popleft()
-        return action
+        return action,used_images,attn_maps
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
@@ -194,13 +200,14 @@ class DiffusionModel(nn.Module):
         # --- 3. Env State ---
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
-            
+        print(f"global cond dim: {global_cond_dim}" )
         # --- 4. NEW: Audio / Spectrogram ---
         # We detect if we need audio encoder based on config or feature presence
         self.use_audio = getattr(config, "audio_backbone", None) is not None
         if self.use_audio:
             self.audio_encoder = DiffusionAudioEncoder(config)
             global_cond_dim += self.audio_encoder.feature_dim
+        print(f"global cond dim after audio: {global_cond_dim}" )
 
         # U-Net
         self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
@@ -266,16 +273,22 @@ class DiffusionModel(nn.Module):
         global_cond_feats = [batch[OBS_STATE]]
 
         # 2. Images
+        all_attn_maps=[]
+
         # Extract image features.
         if self.config.image_features:
             if self.config.use_separate_rgb_encoder_per_camera:
                 # Combine batch and sequence dims while rearranging to make the camera index dimension first.
                 images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
+                encoded_feat_and_attn_maps = [
+                    encoder(images)
+                    for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
+                ]
+                encoded_feat = [enc for enc,attn in encoded_feat_and_attn_maps]
+                attention_map = [attn for enc,attn in encoded_feat_and_attn_maps]
+
                 img_features_list = torch.cat(
-                    [
-                        encoder(images)
-                        for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
-                    ]
+                    encoded_feat
                 )
                 # Separate batch and sequence dims back out. The camera index dim gets absorbed into the
                 # feature dim (effectively concatenating the camera features).
@@ -284,7 +297,7 @@ class DiffusionModel(nn.Module):
                 )
             else:
                 # Combine batch, sequence, and "which camera" dims before passing to shared encoder.
-                img_features = self.rgb_encoder(
+                img_features,attention_map  = self.rgb_encoder(
                     einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
                 )
                 # Separate batch dim and sequence dim back out. The camera index dim gets absorbed into the
@@ -293,13 +306,20 @@ class DiffusionModel(nn.Module):
                     img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
                 )
             global_cond_feats.append(img_features)
+            all_attn_maps.append(attention_map)
 
         # 3. Env State
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV_STATE])
 
         # 4. NEW: Audio
-        if self.use_audio and OBS_AUDIO in batch:
+        if self.use_audio:
+            # Check strictly if key exists to prevent shape mismatch error later
+            if OBS_AUDIO not in batch:
+                raise ValueError(
+                    f"Model is configured with audio, but '{OBS_AUDIO}' is missing from the input batch. "
+                    "Ensure your environment wrapper provides this key."
+                )
             # batch[OBS_AUDIO] shape: (B, S, Time, Freq)
             # Flatten B and S
             # torch.Size([32, 2, 3, 298, 128])
@@ -314,7 +334,7 @@ class DiffusionModel(nn.Module):
             global_cond_feats.append(audio_feats)
 
         # Concatenate features then flatten to (B, global_cond_dim).
-        return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
+        return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1),all_attn_maps
 
     def generate_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """
@@ -331,7 +351,7 @@ class DiffusionModel(nn.Module):
         assert n_obs_steps == self.config.n_obs_steps
 
         # Encode image features and concatenate them all together along with the state vector.
-        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+        global_cond,attn_maps = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
         # run sampling
         actions = self.conditional_sample(batch_size, global_cond=global_cond, noise=noise)
@@ -341,7 +361,7 @@ class DiffusionModel(nn.Module):
         end = start + self.config.n_action_steps
         actions = actions[:, start:end]
 
-        return actions
+        return actions,attn_maps
 
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
         """
@@ -365,7 +385,7 @@ class DiffusionModel(nn.Module):
         assert horizon == self.config.horizon
         assert n_obs_steps == self.config.n_obs_steps
         # Encode image features and concatenate them all together along with the state vector.
-        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+        global_cond,attn_maps = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
         # Forward diffusion.
         trajectory = batch[ACTION]
@@ -508,7 +528,7 @@ class SpatialSoftmax(nn.Module):
     linear mapping (in_channels, H, W) -> (num_kp, H, W).
     """
 
-    def __init__(self, input_shape, num_kp=None):
+    def __init__(self, input_shape, num_kp=None,return_attention=False):
         """
         Args:
             input_shape (list): (C, H, W) input feature map shape.
@@ -533,6 +553,7 @@ class SpatialSoftmax(nn.Module):
         pos_y = torch.from_numpy(pos_y.reshape(self._in_h * self._in_w, 1)).float()
         # register as buffer so it's moved to the correct device.
         self.register_buffer("pos_grid", torch.cat([pos_x, pos_y], dim=1))
+        self.return_attention = return_attention
 
     def forward(self, features: Tensor) -> Tensor:
         """
@@ -543,7 +564,7 @@ class SpatialSoftmax(nn.Module):
         """
         if self.nets is not None:
             features = self.nets(features)
-
+        B, C, H, W = features.shape
         # [B, K, H, W] -> [B * K, H * W] where K is number of keypoints
         features = features.reshape(-1, self._in_h * self._in_w)
         # 2d softmax normalization
@@ -552,7 +573,10 @@ class SpatialSoftmax(nn.Module):
         expected_xy = attention @ self.pos_grid
         # reshape to [B, K, 2]
         feature_keypoints = expected_xy.view(-1, self._out_c, 2)
-
+        if self.return_attention:
+            attn_map = attention.view(B, self._out_c, H, W)
+            return feature_keypoints, attn_map
+        
         return feature_keypoints
 
 
@@ -606,7 +630,7 @@ class DiffusionRgbEncoder(nn.Module):
         dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
-        self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
+        self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints,return_attention=True)
         self.feature_dim = config.spatial_softmax_num_keypoints * 2
         self.out = nn.Linear(config.spatial_softmax_num_keypoints * 2, self.feature_dim)
         self.relu = nn.ReLU()
@@ -626,10 +650,14 @@ class DiffusionRgbEncoder(nn.Module):
                 # Always use center crop for eval.
                 x = self.center_crop(x)
         # Extract backbone feature.
-        x = torch.flatten(self.pool(self.backbone(x)), start_dim=1)
+        fmap = self.backbone(x)
+
+        keypoints, attn = self.pool(fmap)   # <-- now also receive attention map
+
+        x = torch.flatten(keypoints, start_dim=1)
         # Final linear layer with non-linearity.
         x = self.relu(self.out(x))
-        return x
+        return x,attn
 
 
 def _replace_submodules(
