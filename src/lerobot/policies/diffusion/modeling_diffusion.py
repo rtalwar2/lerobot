@@ -272,6 +272,11 @@ class DiffusionModel(nn.Module):
         # 1. State
         global_cond_feats = [batch[OBS_STATE]]
 
+        # # --- DEBUG START ---
+        # print(f"DEBUG: Batch Size: {batch_size}, Steps: {n_obs_steps}")
+        # print(f"DEBUG: State shape: {batch[OBS_STATE].shape}")
+        # # --- DEBUG END ---
+
         # 2. Images
         all_attn_maps=[]
 
@@ -307,11 +312,15 @@ class DiffusionModel(nn.Module):
                 )
             global_cond_feats.append(img_features)
             all_attn_maps.append(attention_map)
-
+            # # --- DEBUG START ---
+            # print(f"DEBUG: Image features shape: {img_features.shape}")
+            # # --- DEBUG END ---
         # 3. Env State
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV_STATE])
-
+            # # --- DEBUG START ---
+            # print(f"DEBUG: Env State shape: {batch[OBS_ENV_STATE].shape}")
+            # # --- DEBUG END ---
         # 4. NEW: Audio
         if self.use_audio:
             # Check strictly if key exists to prevent shape mismatch error later
@@ -332,6 +341,9 @@ class DiffusionModel(nn.Module):
             # Reshape back to (B, S, Dim)
             audio_feats = einops.rearrange(audio_feats, "(b s) d -> b s d", b=batch_size, s=n_obs_steps)
             global_cond_feats.append(audio_feats)
+            # # --- DEBUG START ---
+            # print(f"DEBUG: Audio features shape: {audio_feats.shape}")
+            # # --- DEBUG END ---
 
         # Concatenate features then flatten to (B, global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1),all_attn_maps
