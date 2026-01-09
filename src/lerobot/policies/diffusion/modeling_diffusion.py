@@ -190,6 +190,8 @@ class DiffusionModel(nn.Module):
         # --- 2. Images ---
         if self.config.image_features:
             num_images = len(self.config.image_features)
+            print(f"num images : {num_images}")
+            print(f"image features = {self.config.image_features}")
             if self.config.use_separate_rgb_encoder_per_camera:
                 encoders = [DiffusionRgbEncoder(config) for _ in range(num_images)]
                 self.rgb_encoder = nn.ModuleList(encoders)
@@ -208,7 +210,11 @@ class DiffusionModel(nn.Module):
             self.audio_encoder = DiffusionAudioEncoder(config)
             global_cond_dim += self.audio_encoder.feature_dim
         print(f"global cond dim after audio: {global_cond_dim}" )
+<<<<<<< HEAD
 
+=======
+        
+>>>>>>> 94a7e8a7 (added intermediate layer)
         # U-Net
         self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
 
@@ -455,7 +461,7 @@ class DiffusionAudioEncoder(nn.Module):
         # This is critical for resizing positional embeddings
         hf_config = AutoConfig.from_pretrained(config.audio_backbone)
         hf_config.max_length = config.time_dimension #298
-        
+        self.head=None
         
         if config.audio_feature_type == "classifier":
             self.feature_dim = hf_config.num_labels      
@@ -465,12 +471,22 @@ class DiffusionAudioEncoder(nn.Module):
             ignore_mismatched_sizes=False,  # Rescales positional embeddings for 300-frame spectrograms
             )
         elif config.audio_feature_type == "embedding":
-            self.feature_dim = hf_config.hidden_size
-            self.backbone = ASTModel.from_pretrained(
-            config.audio_backbone,
-            config=hf_config,
-            ignore_mismatched_sizes=True,  # Rescales positional embeddings for 300-frame spectrograms
-            )
+            if config.add_intermediate_audio_layer:
+                print("adding intermediate layer")
+                self.feature_dim = 64
+                self.head = nn.Linear(hf_config.hidden_size, 64)
+                self.backbone = ASTModel.from_pretrained(
+                config.audio_backbone,
+                config=hf_config,
+                ignore_mismatched_sizes=True,  # Rescales positional embeddings for 300-frame spectrograms
+                )
+            else: 
+                self.feature_dim = hf_config.hidden_size
+                self.backbone = ASTModel.from_pretrained(
+                config.audio_backbone,
+                config=hf_config,
+                ignore_mismatched_sizes=True,  # Rescales positional embeddings for 300-frame spectrograms
+                )
 
         self.mean = config.audio_norm_mean
         self.std = config.audio_norm_std
@@ -502,7 +518,13 @@ class DiffusionAudioEncoder(nn.Module):
         if self.config.audio_feature_type == "classifier":
             return outputs.logits
         elif self.config.audio_feature_type == "embedding":
-            return outputs.pooler_output
+            embeddings = outputs.pooler_output
+            if self.head is not None:
+                # Experiment: Pseudoinstrumentation (return logits)
+                return self.head(embeddings)
+            else:
+                # Experiment: Raw Embeddings
+                return embeddings
         
         # # 3. Get Pooling output (CLS token usually)
         # # pooler_output shape: (B, 768)

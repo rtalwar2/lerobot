@@ -144,6 +144,7 @@ class DiffusionConfig(PreTrainedConfig):
     # num_audio_classes: int = 2 #this will always be frozen from pretrained model
     time_dimension:int = 298
     freeze_audio_encoder:bool = True
+    add_intermediate_audio_layer:bool = False
     # --------------------------------------
     
     # Unet.
