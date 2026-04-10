@@ -131,6 +131,20 @@ class DiffusionConfig(PreTrainedConfig):
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
 
+    # Optional RGB binary encoder branch used as extra global conditioning.
+    # Set to None to disable this branch.
+    rgb_binary_backbone: str | None = None
+    # Optional pretrained weights enum for torchvision backbone construction.
+    rgb_binary_pretrained_backbone_weights: str | None = None
+    # Optional local checkpoint path for a separately pretrained RGB binary model.
+    rgb_binary_checkpoint_path: str | None = None
+    rgb_binary_norm_mean: float = 0.0
+    rgb_binary_norm_std: float = 1.0
+    freeze_rgb_binary_encoder: bool = True
+    # Global conditioning can use probability (default) or thresholded binary output.
+    rgb_binary_output_type: str = "probability"
+    rgb_binary_threshold: float = 0.5
+
 
     # --- NEW: Audio / AST Configuration ---
     # Name of the HuggingFace checkpoint
@@ -188,6 +202,23 @@ class DiffusionConfig(PreTrainedConfig):
         
         if self.audio_feature_type not in ["embedding", "classifier"]:
             raise ValueError("audio_feature_type must be 'embedding' or 'classifier'")
+
+        if self.rgb_binary_backbone is not None and not self.rgb_binary_backbone.startswith("resnet"):
+            raise ValueError(
+                "`rgb_binary_backbone` must be one of the ResNet variants when enabled. "
+                f"Got {self.rgb_binary_backbone}."
+            )
+
+        supported_rgb_binary_output_types = ["probability", "thresholded"]
+        if self.rgb_binary_output_type not in supported_rgb_binary_output_types:
+            raise ValueError(
+                "`rgb_binary_output_type` must be one of "
+                f"{supported_rgb_binary_output_types}. Got {self.rgb_binary_output_type}."
+            )
+        if not 0.0 <= self.rgb_binary_threshold <= 1.0:
+            raise ValueError(
+                f"`rgb_binary_threshold` must be in [0, 1]. Got {self.rgb_binary_threshold}."
+            )
 
         supported_prediction_types = ["epsilon", "sample"]
         if self.prediction_type not in supported_prediction_types:

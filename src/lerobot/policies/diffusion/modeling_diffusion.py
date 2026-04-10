@@ -21,6 +21,7 @@ TODO(alexander-soare):
 """
 
 import math
+from pathlib import Path
 from collections import deque
 from collections.abc import Callable
 
@@ -202,19 +203,31 @@ class DiffusionModel(nn.Module):
         # --- 3. Env State ---
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
+
+        # --- 4. Optional RGB Binary Branch ---
+        self.use_rgb_binary = getattr(config, "rgb_binary_backbone", None) is not None
+        if self.use_rgb_binary:
+            if not self.config.image_features:
+                raise ValueError("`rgb_binary_backbone` is enabled but no image features are configured.")
+            num_images = len(self.config.image_features)
+            if self.config.use_separate_rgb_encoder_per_camera:
+                binary_encoders = [DiffusionRgbBinaryEncoder(config) for _ in range(num_images)]
+                self.rgb_binary_encoder = nn.ModuleList(binary_encoders)
+            else:
+                self.rgb_binary_encoder = DiffusionRgbBinaryEncoder(config)
+            # We append one scalar per camera to conditioning for each observation step.
+            global_cond_dim += num_images
+
         print(f"global cond dim: {global_cond_dim}" )
-        # --- 4. NEW: Audio / Spectrogram ---
+        # --- 5. NEW: Audio / Spectrogram ---
         # We detect if we need audio encoder based on config or feature presence
         self.use_audio = getattr(config, "audio_backbone", None) is not None
         if self.use_audio:
             self.audio_encoder = DiffusionAudioEncoder(config)
             global_cond_dim += self.audio_encoder.feature_dim
         print(f"global cond dim after audio: {global_cond_dim}" )
-<<<<<<< HEAD
 
-=======
         
->>>>>>> 94a7e8a7 (added intermediate layer)
         # U-Net
         self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
 
@@ -321,6 +334,34 @@ class DiffusionModel(nn.Module):
             # # --- DEBUG START ---
             # print(f"DEBUG: Image features shape: {img_features.shape}")
             # # --- DEBUG END ---
+
+        # 2b. Optional RGB binary features from the same image observations.
+        if self.use_rgb_binary:
+            if OBS_IMAGES not in batch:
+                raise ValueError(
+                    f"Model is configured with RGB binary branch, but '{OBS_IMAGES}' is missing from the input batch."
+                )
+
+            if self.config.use_separate_rgb_encoder_per_camera:
+                images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
+                binary_probs = [
+                    encoder(images)
+                    for encoder, images in zip(self.rgb_binary_encoder, images_per_camera, strict=True)
+                ]
+                # [n, b*s, 1] -> [b, s, n]
+                stacked_probs = torch.cat(binary_probs, dim=0)
+                rgb_binary_features = einops.rearrange(
+                    stacked_probs, "(n b s) d -> b s (n d)", b=batch_size, s=n_obs_steps
+                )
+            else:
+                flat_images = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
+                flat_probs = self.rgb_binary_encoder(flat_images)
+                rgb_binary_features = einops.rearrange(
+                    flat_probs, "(b s n) d -> b s (n d)", b=batch_size, s=n_obs_steps
+                )
+
+            global_cond_feats.append(rgb_binary_features)
+
         # 3. Env State
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV_STATE])
@@ -692,6 +733,92 @@ class DiffusionRgbEncoder(nn.Module):
         # Final linear layer with non-linearity.
         x = self.relu(self.out(x))
         return x,attn
+
+
+class DiffusionRgbBinaryEncoder(nn.Module):
+    """Encodes an RGB image to a scalar binary signal for global conditioning."""
+
+    def __init__(self, config: DiffusionConfig):
+        super().__init__()
+        self.config = config
+
+        if config.crop_shape is not None:
+            self.do_crop = True
+            self.center_crop = torchvision.transforms.CenterCrop(config.crop_shape)
+            if config.crop_is_random:
+                self.maybe_random_crop = torchvision.transforms.RandomCrop(config.crop_shape)
+            else:
+                self.maybe_random_crop = self.center_crop
+        else:
+            self.do_crop = False
+
+        backbone_name = config.rgb_binary_backbone or config.vision_backbone
+        backbone_model = getattr(torchvision.models, backbone_name)(
+            weights=config.rgb_binary_pretrained_backbone_weights
+        )
+        # Keep the final FC as the only task-specific layer for binary score prediction.
+        in_features = backbone_model.fc.in_features
+        backbone_model.fc = nn.Linear(in_features, 1)
+        self.backbone = backbone_model
+        self.feature_dim = 1
+
+        checkpoint_path = getattr(config, "rgb_binary_checkpoint_path", None)
+        if checkpoint_path:
+            checkpoint_path = Path(checkpoint_path)
+            if not checkpoint_path.exists():
+                raise ValueError(f"RGB binary checkpoint path does not exist: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            state_dict = checkpoint.get("state_dict", checkpoint)
+            if not isinstance(state_dict, dict):
+                raise ValueError(
+                    "RGB binary checkpoint must be a state dict or a dict containing a 'state_dict' key."
+                )
+
+            # Support checkpoints saved from wrapped modules.
+            state_dict = {
+                k.replace("module.", "", 1) if k.startswith("module.") else k: v
+                for k, v in state_dict.items()
+            }
+            load_result = self.backbone.load_state_dict(state_dict, strict=False)
+            print(
+                "Loaded RGB binary checkpoint",
+                f"missing_keys={len(load_result.missing_keys)}",
+                f"unexpected_keys={len(load_result.unexpected_keys)}",
+            )
+
+        self.mean = config.rgb_binary_norm_mean
+        self.std = config.rgb_binary_norm_std
+
+        if getattr(config, "freeze_rgb_binary_encoder", True):
+            self.backbone.requires_grad_(False)
+            print("RGB binary encoder is FROZEN.")
+        else:
+            self.backbone.requires_grad_(True)
+            print("RGB binary encoder is TRAINING (End-to-End).")
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: (B, C, H, W) image tensor with pixel values in [0, 1].
+        Returns:
+            (B, 1) scalar signal per image for conditioning.
+        """
+        if self.do_crop:
+            if self.training:
+                x = self.maybe_random_crop(x)
+            else:
+                x = self.center_crop(x)
+
+        # Avoid division by zero if normalization std is accidentally set to 0.
+        denom = max(self.std, 1e-6)
+        x = (x - self.mean) / denom
+
+        logits = self.backbone(x)
+        probs = torch.sigmoid(logits)
+
+        if self.config.rgb_binary_output_type == "thresholded":
+            return (probs >= self.config.rgb_binary_threshold).float()
+        return probs
 
 
 def _replace_submodules(
