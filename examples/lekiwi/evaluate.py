@@ -14,15 +14,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.utils import hw_to_dataset_features
-from lerobot.policies.act.modeling_act import ACTPolicy
-from lerobot.policies.factory import make_pre_post_processors
+from lerobot.common.control_utils import init_keyboard_listener
+from lerobot.datasets import LeRobotDataset
+from lerobot.policies import make_pre_post_processors
+from lerobot.policies.act import ACTPolicy
 from lerobot.processor import make_default_processors
 from lerobot.robots.lekiwi import LeKiwiClient, LeKiwiClientConfig
 from lerobot.scripts.lerobot_record import record_loop
 from lerobot.utils.constants import ACTION, OBS_STR
-from lerobot.utils.control_utils import init_keyboard_listener
+from lerobot.utils.feature_utils import hw_to_dataset_features
 from lerobot.utils.utils import log_say
 from lerobot.utils.visualization_utils import init_rerun
 
@@ -78,40 +78,24 @@ def main():
     listener, events = init_keyboard_listener()
     init_rerun(session_name="lekiwi_evaluate")
 
-    if not robot.is_connected:
-        raise ValueError("Robot is not connected!")
+    try:
+        if not robot.is_connected:
+            raise ValueError("Robot is not connected!")
 
-    print("Starting evaluate loop...")
-    recorded_episodes = 0
-    while recorded_episodes < NUM_EPISODES and not events["stop_recording"]:
-        log_say(f"Running inference, recording eval episode {recorded_episodes} of {NUM_EPISODES}")
+        print("Starting evaluate loop...")
+        recorded_episodes = 0
+        while recorded_episodes < NUM_EPISODES and not events["stop_recording"]:
+            log_say(f"Running inference, recording eval episode {recorded_episodes} of {NUM_EPISODES}")
 
-        # Main record loop
-        record_loop(
-            robot=robot,
-            events=events,
-            fps=FPS,
-            policy=policy,
-            preprocessor=preprocessor,  # Pass the pre and post policy processors
-            postprocessor=postprocessor,
-            dataset=dataset,
-            control_time_s=EPISODE_TIME_SEC,
-            single_task=TASK_DESCRIPTION,
-            display_data=True,
-            teleop_action_processor=teleop_action_processor,
-            robot_action_processor=robot_action_processor,
-            robot_observation_processor=robot_observation_processor,
-        )
-
-        # Reset the environment if not stopping or re-recording
-        if not events["stop_recording"] and (
-            (recorded_episodes < NUM_EPISODES - 1) or events["rerecord_episode"]
-        ):
-            log_say("Reset the environment")
+            # Main record loop
             record_loop(
                 robot=robot,
                 events=events,
                 fps=FPS,
+                policy=policy,
+                preprocessor=preprocessor,  # Pass the pre and post policy processors
+                postprocessor=postprocessor,
+                dataset=dataset,
                 control_time_s=EPISODE_TIME_SEC,
                 single_task=TASK_DESCRIPTION,
                 display_data=True,
@@ -120,24 +104,42 @@ def main():
                 robot_observation_processor=robot_observation_processor,
             )
 
-        if events["rerecord_episode"]:
-            log_say("Re-record episode")
-            events["rerecord_episode"] = False
-            events["exit_early"] = False
-            dataset.clear_episode_buffer()
-            continue
+            # Reset the environment if not stopping or re-recording
+            if not events["stop_recording"] and (
+                (recorded_episodes < NUM_EPISODES - 1) or events["rerecord_episode"]
+            ):
+                log_say("Reset the environment")
+                record_loop(
+                    robot=robot,
+                    events=events,
+                    fps=FPS,
+                    control_time_s=EPISODE_TIME_SEC,
+                    single_task=TASK_DESCRIPTION,
+                    display_data=True,
+                    teleop_action_processor=teleop_action_processor,
+                    robot_action_processor=robot_action_processor,
+                    robot_observation_processor=robot_observation_processor,
+                )
 
-        # Save episode
-        dataset.save_episode()
-        recorded_episodes += 1
+            if events["rerecord_episode"]:
+                log_say("Re-record episode")
+                events["rerecord_episode"] = False
+                events["exit_early"] = False
+                dataset.clear_episode_buffer()
+                continue
 
-    # Clean up
-    log_say("Stop recording")
-    robot.disconnect()
-    listener.stop()
+            # Save episode
+            dataset.save_episode()
+            recorded_episodes += 1
 
-    dataset.finalize()
-    dataset.push_to_hub()
+    finally:
+        # Clean up
+        log_say("Stop recording")
+        robot.disconnect()
+        listener.stop()
+
+        dataset.finalize()
+        dataset.push_to_hub()
 
 
 if __name__ == "__main__":
