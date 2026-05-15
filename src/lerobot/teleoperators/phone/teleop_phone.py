@@ -202,6 +202,7 @@ class IOSPhone(BasePhone, Teleoperator):
         # Rising edge then re-capture calibration immediately from current raw pose
         if enable and not self._enabled:
             self._reapply_position_calibration(raw_position)
+            self._calib_rot_inv = raw_rotation.inv()
 
         # Apply calibration
         pos_cal = self._calib_rot_inv.apply(raw_position - self._calib_pos)
@@ -347,6 +348,7 @@ class AndroidPhone(BasePhone, Teleoperator):
         # Rising edge then re-capture calibration immediately from current raw pose
         if enable and not self._enabled:
             self._reapply_position_calibration(raw_pos)
+            self._calib_rot_inv = raw_rot.inv()
 
         # Apply calibration
         pos_cal = self._calib_rot_inv.apply(raw_pos - self._calib_pos)
