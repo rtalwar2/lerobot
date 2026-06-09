@@ -1,0 +1,6 @@
+name: imitation_button_py312
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+prefix: /home/rtalwar/miniconda3/envs/imitation_button_py312

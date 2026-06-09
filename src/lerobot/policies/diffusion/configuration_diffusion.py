@@ -156,6 +156,8 @@ class DiffusionConfig(PreTrainedConfig):
     time_dimension:int = 298
     freeze_audio_encoder:bool = True
     add_intermediate_audio_layer:bool = False
+        # --- NEW: Flag to train from scratch ---
+    pretrained_audio_weights: bool = True
     # --------------------------------------
     
     # Unet.

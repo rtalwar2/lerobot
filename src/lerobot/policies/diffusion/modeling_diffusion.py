@@ -509,7 +509,6 @@ class DiffusionModel(nn.Module):
 
 
 # --- NEW CLASS: DiffusionAudioEncoder ---
-
 class DiffusionAudioEncoder(nn.Module):
     """
     Encodes audio spectrograms using an AST backbone.
@@ -520,48 +519,61 @@ class DiffusionAudioEncoder(nn.Module):
         self.config = config
         
         # Load Config first to set max_length correctly before model init
-        # This is critical for resizing positional embeddings
         hf_config = AutoConfig.from_pretrained(config.audio_backbone)
         hf_config.max_length = config.time_dimension #298
-        self.head=None
+        self.head = None
         
         if config.audio_feature_type == "classifier":
             self.feature_dim = hf_config.num_labels      
-            self.backbone = ASTForAudioClassification.from_pretrained(
-            config.audio_backbone,
-            config=hf_config,
-            ignore_mismatched_sizes=False,  # Rescales positional embeddings for 300-frame spectrograms
-            )
+            
+            if getattr(config, "pretrained_audio_weights", True):
+                self.backbone = ASTForAudioClassification.from_pretrained(
+                    config.audio_backbone,
+                    config=hf_config,
+                    ignore_mismatched_sizes=False,
+                )
+            else:
+                # Initializes with RANDOM weights based on the config architecture
+                self.backbone = ASTForAudioClassification(hf_config)
+                
         elif config.audio_feature_type == "embedding":
+            # Setup intermediate layer sizes
             if config.add_intermediate_audio_layer:
                 print("adding intermediate layer")
                 self.feature_dim = 64
                 self.head = nn.Linear(hf_config.hidden_size, 64)
-                self.backbone = ASTModel.from_pretrained(
-                config.audio_backbone,
-                config=hf_config,
-                ignore_mismatched_sizes=True,  # Rescales positional embeddings for 300-frame spectrograms
-                )
             else: 
                 self.feature_dim = hf_config.hidden_size
+            
+            # Initialize Backbone
+            if getattr(config, "pretrained_audio_weights", True):
                 self.backbone = ASTModel.from_pretrained(
-                config.audio_backbone,
-                config=hf_config,
-                ignore_mismatched_sizes=True,  # Rescales positional embeddings for 300-frame spectrograms
+                    config.audio_backbone,
+                    config=hf_config,
+                    ignore_mismatched_sizes=True,
                 )
+            else:
+                # Initializes with RANDOM weights based on the config architecture
+                print("initializing audio backbone with random weights")
+                self.backbone = ASTModel(hf_config)
 
         self.mean = config.audio_norm_mean
         self.std = config.audio_norm_std
         
-        # 4. Freezing Logic (As requested)
-        # Default to True (Frozen) if not specified in config
-        if getattr(config, "freeze_audio_encoder", True):
+        # 4. Freezing Logic
+        # ⚠️ CRITICAL: If training from scratch, you MUST unfreeze it!
+        should_freeze = getattr(config, "freeze_audio_encoder", True)
+        if not getattr(config, "pretrained_audio_weights", True) and should_freeze:
+            print("WARNING: You are initializing from scratch but freeze_audio_encoder is True. Unfreezing automatically!")
+            should_freeze = False
+
+        if should_freeze:
             self.backbone.requires_grad_(False)
             print(f"Audio Encoder ({config.audio_feature_type}) is FROZEN.")
         else:
             self.backbone.requires_grad_(True)
             print(f"Audio Encoder ({config.audio_feature_type}) is TRAINING (End-to-End).")
-
+            
     def forward(self, x: Tensor) -> Tensor:
         """
         Args:
