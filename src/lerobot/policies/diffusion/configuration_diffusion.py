@@ -159,7 +159,18 @@ class DiffusionConfig(PreTrainedConfig):
         # --- NEW: Flag to train from scratch ---
     pretrained_audio_weights: bool = True
     # --------------------------------------
-    
+
+    # --- Encoder initialization from a locally pretrained checkpoint ---
+    # Paths to checkpoints holding an {"encoder_state_dict": ...} produced by pretraining the
+    # corresponding encoder class on an auxiliary target (e.g. an instrumentation signal). Applied
+    # after the encoders are constructed, so the checkpoint must come from an encoder built with
+    # THIS SAME config -- the load is strict and will fail loudly otherwise.
+    # Distinct from `pretrained_backbone_weights` / `pretrained_audio_weights`, which select generic
+    # ImageNet / AudioSet weights; keeping them separate means a config still says which it uses.
+    rgb_encoder_init_checkpoint: str | None = None
+    audio_encoder_init_checkpoint: str | None = None
+
+
     # Unet.
     down_dims: tuple[int, ...] = (512, 1024, 2048)
     kernel_size: int = 5

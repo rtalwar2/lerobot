@@ -221,18 +221,14 @@ class DiffusionModel(nn.Module):
             global_cond_dim += self.config.env_state_feature.shape[0]
 
         # --- 4. Optional RGB Binary Branch ---
+        # DiffusionRgbBinaryEncoder is currently commented out further down this file, so this branch
+        # cannot be constructed. Fail with an explanation rather than a bare NameError.
         self.use_rgb_binary = getattr(config, "rgb_binary_backbone", None) is not None
         if self.use_rgb_binary:
-            if not self.config.image_features:
-                raise ValueError("`rgb_binary_backbone` is enabled but no image features are configured.")
-            num_images = len(self.config.image_features)
-            if self.config.use_separate_rgb_encoder_per_camera:
-                binary_encoders = [DiffusionRgbBinaryEncoder(config) for _ in range(num_images)]
-                self.rgb_binary_encoder = nn.ModuleList(binary_encoders)
-            else:
-                self.rgb_binary_encoder = DiffusionRgbBinaryEncoder(config)
-            # We append one scalar per camera to conditioning for each observation step.
-            global_cond_dim += num_images
+            raise NotImplementedError(
+                "`rgb_binary_backbone` is set but DiffusionRgbBinaryEncoder is commented out in "
+                "modeling_diffusion.py. Restore the class before enabling this branch."
+            )
 
         print(f"global cond dim: {global_cond_dim}" )
         # --- 5. NEW: Audio / Spectrogram ---
@@ -243,7 +239,8 @@ class DiffusionModel(nn.Module):
             global_cond_dim += self.audio_encoder.feature_dim
         print(f"global cond dim after audio: {global_cond_dim}" )
 
-        
+        self._load_encoder_init_checkpoints()
+
         # U-Net
         self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
 
@@ -268,6 +265,35 @@ class DiffusionModel(nn.Module):
             self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
         else:
             self.num_inference_steps = config.num_inference_steps
+
+    def _load_encoder_init_checkpoints(self) -> None:
+        """Initialize encoders from locally pretrained checkpoints, if any are configured.
+
+        Used for the "pretrain an encoder on an auxiliary target, then use it as policy init" variant.
+        Loading is strict on purpose: a checkpoint that silently failed to apply would leave the
+        encoder at its default initialization, which no training curve would reveal.
+        """
+        targets = []
+        if self.config.rgb_encoder_init_checkpoint is not None:
+            if not self.config.image_features:
+                raise ValueError("`rgb_encoder_init_checkpoint` is set but no image features are configured.")
+            modules = (
+                list(self.rgb_encoder)
+                if self.config.use_separate_rgb_encoder_per_camera
+                else [self.rgb_encoder]
+            )
+            targets.append((self.config.rgb_encoder_init_checkpoint, modules))
+        if self.config.audio_encoder_init_checkpoint is not None:
+            if not self.use_audio:
+                raise ValueError("`audio_encoder_init_checkpoint` is set but the audio branch is disabled.")
+            targets.append((self.config.audio_encoder_init_checkpoint, [self.audio_encoder]))
+
+        for checkpoint_path, modules in targets:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            state_dict = checkpoint["encoder_state_dict"]
+            for module in modules:
+                module.load_state_dict(state_dict, strict=True)
+            print(f"initialized {len(modules)} encoder(s) from {checkpoint_path}")
 
     # ========= inference  ============
     def conditional_sample(
@@ -509,6 +535,81 @@ class DiffusionModel(nn.Module):
 
 
 # --- NEW CLASS: DiffusionAudioEncoder ---
+def _ast_patch_grid(hf_config) -> tuple[int, int]:
+    """(frequency, time) patch counts for an AST config -- what position_embeddings is sized for."""
+    frequency = (hf_config.num_mel_bins - hf_config.patch_size) // hf_config.frequency_stride + 1
+    time = (hf_config.max_length - hf_config.patch_size) // hf_config.time_stride + 1
+    return frequency, time
+
+
+def _resize_ast_pos_embed(pos_embed: Tensor, src_config, dst_config) -> Tensor:
+    """Adapt AST position embeddings from src_config's max_length to dst_config's.
+
+    Necessary because the AudioSet checkpoints are trained at max_length=1024 while we feed much
+    shorter spectrograms: the patch count changes, so `position_embeddings` no longer matches. The
+    obvious workaround (`from_pretrained(..., ignore_mismatched_sizes=True)`) does NOT rescale them
+    -- it silently re-initializes them at random, handing pretrained transformer blocks position
+    encodings they were never trained with.
+
+    Shrinking takes a centre slice rather than interpolating, following the reference AST
+    implementation: the embeddings encode absolute position in a 10.24s window at a fixed patch
+    stride, and our clips use that same stride, so a contiguous slice keeps the positional scale
+    consistent with pretraining. Interpolating would compress the whole window into fewer frames and
+    change the effective time scale. Growing has no slice to take, so it interpolates.
+    """
+    f_src, t_src = _ast_patch_grid(src_config)
+    f_dst, t_dst = _ast_patch_grid(dst_config)
+
+    # AST prepends a cls and a distillation token, which carry no positional meaning to rescale.
+    n_special = pos_embed.shape[1] - f_src * t_src
+    special, patches = pos_embed[:, :n_special], pos_embed[:, n_special:]
+    embed_dim = patches.shape[-1]
+
+    patches = patches.reshape(1, f_src, t_src, embed_dim).permute(0, 3, 1, 2)  # (1, d, f, t)
+    if t_dst <= t_src:
+        start = t_src // 2 - t_dst // 2
+        patches = patches[:, :, :, start : start + t_dst]
+    else:
+        patches = F.interpolate(patches, size=(f_src, t_dst), mode="bilinear", align_corners=False)
+    if f_dst != patches.shape[2]:
+        patches = F.interpolate(patches, size=(f_dst, patches.shape[3]), mode="bilinear", align_corners=False)
+    patches = patches.permute(0, 2, 3, 1).reshape(1, f_dst * t_dst, embed_dim)
+
+    return torch.cat([special, patches], dim=1)
+
+
+def _load_pretrained_ast(model_class, backbone: str, hf_config, pos_embed_key: str, drop_prefixes=()):
+    """Build `model_class` for `hf_config` and fill it with `backbone`'s pretrained weights.
+
+    The checkpoint is loaded at its own native max_length first, so its position embeddings arrive
+    intact, and only then resized to hf_config's patch count. Raises on any key that does not
+    transfer: max_length is supposed to affect position embeddings and nothing else, so an unmatched
+    key means the checkpoint and the target architecture disagree somewhere we haven't accounted for.
+    `drop_prefixes` covers submodules that are deliberately not transferred (e.g. a classifier head
+    resized by num_labels).
+    """
+    native_config = AutoConfig.from_pretrained(backbone)
+    native_state = model_class.from_pretrained(backbone, config=native_config).state_dict()
+    native_state[pos_embed_key] = _resize_ast_pos_embed(
+        native_state[pos_embed_key], native_config, hf_config
+    )
+    native_state = {
+        key: value
+        for key, value in native_state.items()
+        if not any(key.startswith(prefix) for prefix in drop_prefixes)
+    }
+
+    model = model_class(hf_config)
+    missing, unexpected = model.load_state_dict(native_state, strict=False)
+    missing = [key for key in missing if not any(key.startswith(prefix) for prefix in drop_prefixes)]
+    if missing or unexpected:
+        raise RuntimeError(
+            f"AST weight transfer from {backbone} left keys unmatched "
+            f"(missing={missing}, unexpected={unexpected})."
+        )
+    return model
+
+
 class DiffusionAudioEncoder(nn.Module):
     """
     Encodes audio spectrograms using an AST backbone.
@@ -527,10 +628,12 @@ class DiffusionAudioEncoder(nn.Module):
             self.feature_dim = hf_config.num_labels      
             
             if getattr(config, "pretrained_audio_weights", True):
-                self.backbone = ASTForAudioClassification.from_pretrained(
+                self.backbone = _load_pretrained_ast(
+                    ASTForAudioClassification,
                     config.audio_backbone,
-                    config=hf_config,
-                    ignore_mismatched_sizes=False,
+                    hf_config,
+                    "audio_spectrogram_transformer.embeddings.position_embeddings",
+                    drop_prefixes=("classifier.",),  # task-specific head, resized by num_labels
                 )
             else:
                 # Initializes with RANDOM weights based on the config architecture
@@ -547,10 +650,11 @@ class DiffusionAudioEncoder(nn.Module):
             
             # Initialize Backbone
             if getattr(config, "pretrained_audio_weights", True):
-                self.backbone = ASTModel.from_pretrained(
+                self.backbone = _load_pretrained_ast(
+                    ASTModel,
                     config.audio_backbone,
-                    config=hf_config,
-                    ignore_mismatched_sizes=True,
+                    hf_config,
+                    "embeddings.position_embeddings",
                 )
             else:
                 # Initializes with RANDOM weights based on the config architecture
