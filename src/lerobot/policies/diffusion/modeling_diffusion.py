@@ -688,6 +688,97 @@ class SpatialSoftmax(nn.Module):
         return feature_keypoints
 
 
+# class DiffusionRgbEncoder(nn.Module):
+#     """Encodes an RGB image into a 1D feature vector.
+
+#     Includes the ability to normalize and crop the image first.
+#     """
+
+#     def __init__(self, config: DiffusionConfig):
+#         super().__init__()
+#         # Set up optional preprocessing.
+#         if config.resize_shape is not None:
+#             self.resize = torchvision.transforms.Resize(config.resize_shape)
+#         else:
+#             self.resize = None
+
+#         crop_shape = config.crop_shape
+#         if crop_shape is not None:
+#             self.do_crop = True
+#             # Always use center crop for eval
+#             self.center_crop = torchvision.transforms.CenterCrop(crop_shape)
+#             if config.crop_is_random:
+#                 self.maybe_random_crop = torchvision.transforms.RandomCrop(crop_shape)
+#             else:
+#                 self.maybe_random_crop = self.center_crop
+#         else:
+#             self.do_crop = False
+
+#         # Set up backbone.
+#         backbone_model = getattr(torchvision.models, config.vision_backbone)(
+#             weights=config.pretrained_backbone_weights
+#         )
+#         # Note: This assumes that the layer4 feature map is children()[-3]
+#         # TODO(alexander-soare): Use a safer alternative.
+#         self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
+#         if config.use_group_norm:
+#             if config.pretrained_backbone_weights:
+#                 raise ValueError(
+#                     "You can't replace BatchNorm in a pretrained model without ruining the weights!"
+#                 )
+#             self.backbone = _replace_submodules(
+#                 root_module=self.backbone,
+#                 predicate=lambda x: isinstance(x, nn.BatchNorm2d),
+#                 func=lambda x: nn.GroupNorm(num_groups=x.num_features // 16, num_channels=x.num_features),
+#             )
+
+#         # Set up pooling and final layers.
+#         # Use a dry run to get the feature map shape.
+#         # The dummy shape mirrors the runtime preprocessing order: resize -> crop.
+
+#         # Note: we have a check in the config class to make sure all images have the same shape.
+#         images_shape = next(iter(config.image_features.values())).shape
+#         if config.crop_shape is not None:
+#             dummy_shape_h_w = config.crop_shape
+#         elif config.resize_shape is not None:
+#             dummy_shape_h_w = config.resize_shape
+#         else:
+#             dummy_shape_h_w = images_shape[1:]
+#         dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
+#         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
+
+#         self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints,return_attention=True)
+#         self.feature_dim = config.spatial_softmax_num_keypoints * 2
+#         self.out = nn.Linear(config.spatial_softmax_num_keypoints * 2, self.feature_dim)
+#         self.relu = nn.ReLU()
+
+#     def forward(self, x: Tensor) -> Tensor:
+#         """
+#         Args:
+#             x: (B, C, H, W) image tensor with pixel values in [0, 1].
+#         Returns:
+#             (B, D) image feature.
+#         """
+#         # Preprocess: resize if configured, then crop if configured.
+
+#         if self.resize is not None:
+#             x = self.resize(x)
+#         if self.do_crop:
+#             if self.training:  # noqa: SIM108
+#                 x = self.maybe_random_crop(x)
+#             else:
+#                 # Always use center crop for eval.
+#                 x = self.center_crop(x)
+#         # Extract backbone feature.
+#         fmap = self.backbone(x)
+
+#         keypoints, attn = self.pool(fmap)   # <-- now also receive attention map
+
+#         x = torch.flatten(keypoints, start_dim=1)
+#         # Final linear layer with non-linearity.
+#         x = self.relu(self.out(x))
+#         return x,attn
+
 class DiffusionRgbEncoder(nn.Module):
     """Encodes an RGB image into a 1D feature vector.
 
@@ -697,18 +788,12 @@ class DiffusionRgbEncoder(nn.Module):
     def __init__(self, config: DiffusionConfig):
         super().__init__()
         # Set up optional preprocessing.
-        if config.resize_shape is not None:
-            self.resize = torchvision.transforms.Resize(config.resize_shape)
-        else:
-            self.resize = None
-
-        crop_shape = config.crop_shape
-        if crop_shape is not None:
+        if config.crop_shape is not None:
             self.do_crop = True
             # Always use center crop for eval
-            self.center_crop = torchvision.transforms.CenterCrop(crop_shape)
+            self.center_crop = torchvision.transforms.CenterCrop(config.crop_shape)
             if config.crop_is_random:
-                self.maybe_random_crop = torchvision.transforms.RandomCrop(crop_shape)
+                self.maybe_random_crop = torchvision.transforms.RandomCrop(config.crop_shape)
             else:
                 self.maybe_random_crop = self.center_crop
         else:
@@ -718,6 +803,12 @@ class DiffusionRgbEncoder(nn.Module):
         backbone_model = getattr(torchvision.models, config.vision_backbone)(
             weights=config.pretrained_backbone_weights
         )
+        
+        # for name, module in backbone_model.named_modules():
+        #     if name:  # Skip the empty string which represents the root model
+        #         print(name)
+
+
         # Note: This assumes that the layer4 feature map is children()[-3]
         # TODO(alexander-soare): Use a safer alternative.
         self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
@@ -734,22 +825,30 @@ class DiffusionRgbEncoder(nn.Module):
 
         # Set up pooling and final layers.
         # Use a dry run to get the feature map shape.
-        # The dummy shape mirrors the runtime preprocessing order: resize -> crop.
+        # The dummy input should take the number of image channels from `config.image_features` and it should
+        # use the height and width from `config.crop_shape` if it is provided, otherwise it should use the
+        # height and width from `config.image_features`.
 
         # Note: we have a check in the config class to make sure all images have the same shape.
         images_shape = next(iter(config.image_features.values())).shape
-        if config.crop_shape is not None:
-            dummy_shape_h_w = config.crop_shape
-        elif config.resize_shape is not None:
-            dummy_shape_h_w = config.resize_shape
-        else:
-            dummy_shape_h_w = images_shape[1:]
+        dummy_shape_h_w = config.crop_shape if config.crop_shape is not None else images_shape[1:]
         dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
-        self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints,return_attention=True)
-        self.feature_dim = config.spatial_softmax_num_keypoints * 2
-        self.out = nn.Linear(config.spatial_softmax_num_keypoints * 2, self.feature_dim)
+        # self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints,return_attention=True)
+        # --- REPLACE SpatialSoftmax WITH Adaptive Average Pooling ---
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        in_features = feature_map_shape[0]
+        # print(feature_map_shape)
+        # print(f"in features: {in_features}")
+        # # self.feature_dim = config.spatial_softmax_num_keypoints * 2
+        # flattened_feature_map = torch.flatten(feature_map_shape)
+        # self.feature_dim = flattened_feature_map
+        # print(f"feature_map: {flattened_feature_map}")
+        # self.out = nn.Linear(config.spatial_softmax_num_keypoints * 2, self.feature_dim)
+        self.feature_dim = 512
+        self.out = nn.Linear(in_features,512)
         self.relu = nn.ReLU()
 
     def forward(self, x: Tensor) -> Tensor:
@@ -759,10 +858,7 @@ class DiffusionRgbEncoder(nn.Module):
         Returns:
             (B, D) image feature.
         """
-        # Preprocess: resize if configured, then crop if configured.
-
-        if self.resize is not None:
-            x = self.resize(x)
+        # Preprocess: maybe crop (if it was set up in the __init__).
         if self.do_crop:
             if self.training:  # noqa: SIM108
                 x = self.maybe_random_crop(x)
@@ -771,99 +867,98 @@ class DiffusionRgbEncoder(nn.Module):
                 x = self.center_crop(x)
         # Extract backbone feature.
         fmap = self.backbone(x)
+        pooled = self.pool(fmap)
+        # keypoints, attn = self.pool(fmap)   # <-- now also receive attention map
 
-        keypoints, attn = self.pool(fmap)   # <-- now also receive attention map
-
-        x = torch.flatten(keypoints, start_dim=1)
+        x = torch.flatten(pooled, start_dim=1)
         # Final linear layer with non-linearity.
         x = self.relu(self.out(x))
-        return x,attn
+        return x,None
 
+# class DiffusionRgbBinaryEncoder(nn.Module):
+#     """Encodes an RGB image to a scalar binary signal for global conditioning."""
 
-class DiffusionRgbBinaryEncoder(nn.Module):
-    """Encodes an RGB image to a scalar binary signal for global conditioning."""
+#     def __init__(self, config: DiffusionConfig):
+#         super().__init__()
+#         self.config = config
 
-    def __init__(self, config: DiffusionConfig):
-        super().__init__()
-        self.config = config
+#         if config.crop_shape is not None:
+#             self.do_crop = True
+#             self.center_crop = torchvision.transforms.CenterCrop(config.crop_shape)
+#             if config.crop_is_random:
+#                 self.maybe_random_crop = torchvision.transforms.RandomCrop(config.crop_shape)
+#             else:
+#                 self.maybe_random_crop = self.center_crop
+#         else:
+#             self.do_crop = False
 
-        if config.crop_shape is not None:
-            self.do_crop = True
-            self.center_crop = torchvision.transforms.CenterCrop(config.crop_shape)
-            if config.crop_is_random:
-                self.maybe_random_crop = torchvision.transforms.RandomCrop(config.crop_shape)
-            else:
-                self.maybe_random_crop = self.center_crop
-        else:
-            self.do_crop = False
+#         backbone_name = config.rgb_binary_backbone or config.vision_backbone
+#         backbone_model = getattr(torchvision.models, backbone_name)(
+#             weights=config.rgb_binary_pretrained_backbone_weights
+#         )
+#         # Keep the final FC as the only task-specific layer for binary score prediction.
+#         in_features = backbone_model.fc.in_features
+#         backbone_model.fc = nn.Linear(in_features, 1)
+#         self.backbone = backbone_model
+#         self.feature_dim = 1
 
-        backbone_name = config.rgb_binary_backbone or config.vision_backbone
-        backbone_model = getattr(torchvision.models, backbone_name)(
-            weights=config.rgb_binary_pretrained_backbone_weights
-        )
-        # Keep the final FC as the only task-specific layer for binary score prediction.
-        in_features = backbone_model.fc.in_features
-        backbone_model.fc = nn.Linear(in_features, 1)
-        self.backbone = backbone_model
-        self.feature_dim = 1
+#         checkpoint_path = getattr(config, "rgb_binary_checkpoint_path", None)
+#         if checkpoint_path:
+#             checkpoint_path = Path(checkpoint_path)
+#             if not checkpoint_path.exists():
+#                 raise ValueError(f"RGB binary checkpoint path does not exist: {checkpoint_path}")
+#             checkpoint = torch.load(checkpoint_path, map_location="cpu")
+#             state_dict = checkpoint.get("state_dict", checkpoint)
+#             if not isinstance(state_dict, dict):
+#                 raise ValueError(
+#                     "RGB binary checkpoint must be a state dict or a dict containing a 'state_dict' key."
+#                 )
 
-        checkpoint_path = getattr(config, "rgb_binary_checkpoint_path", None)
-        if checkpoint_path:
-            checkpoint_path = Path(checkpoint_path)
-            if not checkpoint_path.exists():
-                raise ValueError(f"RGB binary checkpoint path does not exist: {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location="cpu")
-            state_dict = checkpoint.get("state_dict", checkpoint)
-            if not isinstance(state_dict, dict):
-                raise ValueError(
-                    "RGB binary checkpoint must be a state dict or a dict containing a 'state_dict' key."
-                )
+#             # Support checkpoints saved from wrapped modules.
+#             state_dict = {
+#                 k.replace("module.", "", 1) if k.startswith("module.") else k: v
+#                 for k, v in state_dict.items()
+#             }
+#             load_result = self.backbone.load_state_dict(state_dict, strict=False)
+#             print(
+#                 "Loaded RGB binary checkpoint",
+#                 f"missing_keys={len(load_result.missing_keys)}",
+#                 f"unexpected_keys={len(load_result.unexpected_keys)}",
+#             )
 
-            # Support checkpoints saved from wrapped modules.
-            state_dict = {
-                k.replace("module.", "", 1) if k.startswith("module.") else k: v
-                for k, v in state_dict.items()
-            }
-            load_result = self.backbone.load_state_dict(state_dict, strict=False)
-            print(
-                "Loaded RGB binary checkpoint",
-                f"missing_keys={len(load_result.missing_keys)}",
-                f"unexpected_keys={len(load_result.unexpected_keys)}",
-            )
+#         self.mean = config.rgb_binary_norm_mean
+#         self.std = config.rgb_binary_norm_std
 
-        self.mean = config.rgb_binary_norm_mean
-        self.std = config.rgb_binary_norm_std
+#         if getattr(config, "freeze_rgb_binary_encoder", True):
+#             self.backbone.requires_grad_(False)
+#             print("RGB binary encoder is FROZEN.")
+#         else:
+#             self.backbone.requires_grad_(True)
+#             print("RGB binary encoder is TRAINING (End-to-End).")
 
-        if getattr(config, "freeze_rgb_binary_encoder", True):
-            self.backbone.requires_grad_(False)
-            print("RGB binary encoder is FROZEN.")
-        else:
-            self.backbone.requires_grad_(True)
-            print("RGB binary encoder is TRAINING (End-to-End).")
+#     def forward(self, x: Tensor) -> Tensor:
+#         """
+#         Args:
+#             x: (B, C, H, W) image tensor with pixel values in [0, 1].
+#         Returns:
+#             (B, 1) scalar signal per image for conditioning.
+#         """
+#         if self.do_crop:
+#             if self.training:
+#                 x = self.maybe_random_crop(x)
+#             else:
+#                 x = self.center_crop(x)
 
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Args:
-            x: (B, C, H, W) image tensor with pixel values in [0, 1].
-        Returns:
-            (B, 1) scalar signal per image for conditioning.
-        """
-        if self.do_crop:
-            if self.training:
-                x = self.maybe_random_crop(x)
-            else:
-                x = self.center_crop(x)
+#         # Avoid division by zero if normalization std is accidentally set to 0.
+#         denom = max(self.std, 1e-6)
+#         x = (x - self.mean) / denom
 
-        # Avoid division by zero if normalization std is accidentally set to 0.
-        denom = max(self.std, 1e-6)
-        x = (x - self.mean) / denom
+#         logits = self.backbone(x)
+#         probs = torch.sigmoid(logits)
 
-        logits = self.backbone(x)
-        probs = torch.sigmoid(logits)
-
-        if self.config.rgb_binary_output_type == "thresholded":
-            return (probs >= self.config.rgb_binary_threshold).float()
-        return probs
+#         if self.config.rgb_binary_output_type == "thresholded":
+#             return (probs >= self.config.rgb_binary_threshold).float()
+#         return probs
 
 
 def _replace_submodules(
