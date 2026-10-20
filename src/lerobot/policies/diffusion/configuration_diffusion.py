@@ -196,6 +196,13 @@ class DiffusionConfig(PreTrainedConfig):
 
     # Loss computation
     do_mask_loss_for_padding: bool = False
+    # UMI-style relative actions: the dataset's action is an ABSOLUTE end-effector target [xyz, rot6d(6)] and
+    # observation.state starts with [xyz, extrinsic-xyz euler]; the preprocessor re-expresses every action of a
+    # chunk in the frame of the latest observed pose (SE3RelativeActionsProcessorStep). The dataset's action
+    # stats must then describe the RELATIVE actions. Inference callers convert the output back to absolute
+    # themselves (lerobot.processor.relative_to_absolute_pose_actions) with the pose the chunk was predicted
+    # from -- see se3_relative_action_processor.py for why this is not a postprocessor step.
+    use_relative_actions: bool = False
 
     # Training presets
     optimizer_lr: float = 1e-4

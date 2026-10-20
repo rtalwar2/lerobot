@@ -93,6 +93,11 @@ from .relative_action_processor import (
     to_relative_actions,
 )
 from .rename_processor import RenameObservationsProcessorStep, rename_stats
+from .se3_relative_action_processor import (
+    SE3RelativeActionsProcessorStep,
+    absolute_to_relative_pose_actions,
+    relative_to_absolute_pose_actions,
+)
 from .tokenizer_processor import ActionTokenizerProcessorStep, TokenizerProcessorStep
 
 __all__ = [
@@ -163,6 +168,9 @@ __all__ = [
     "TruncatedProcessorStep",
     "to_absolute_actions",
     "to_relative_actions",
+    "SE3RelativeActionsProcessorStep",
+    "absolute_to_relative_pose_actions",
+    "relative_to_absolute_pose_actions",
     "UnnormalizerProcessorStep",
     "VanillaObservationProcessorStep",
 ]

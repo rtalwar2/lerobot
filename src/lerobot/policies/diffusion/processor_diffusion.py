@@ -25,6 +25,7 @@ from lerobot.processor import (
     PolicyAction,
     PolicyProcessorPipeline,
     RenameObservationsProcessorStep,
+    SE3RelativeActionsProcessorStep,
     UnnormalizerProcessorStep,
     policy_action_to_transition,
     transition_to_policy_action,
@@ -68,6 +69,8 @@ def make_diffusion_pre_post_processors(
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
         DeviceProcessorStep(device=config.device),
+        # absolute -> relative pose actions, on the raw (unnormalized) state; a no-op without an action
+        SE3RelativeActionsProcessorStep(enabled=getattr(config, "use_relative_actions", False)),
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
