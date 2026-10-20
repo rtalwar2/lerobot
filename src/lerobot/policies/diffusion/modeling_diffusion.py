@@ -241,8 +241,37 @@ class DiffusionModel(nn.Module):
 
         self._load_encoder_init_checkpoints()
 
+        unet_global_cond_dim = global_cond_dim * config.n_obs_steps
+        if config.fusion_mode == "modality_attention":
+            # ManiWAV's fusion (see DiffusionConfig.fusion_mode): replaces the image and audio parts
+            # of the conditioning with one fused vector of a single step's image-feature width.
+            if not (self.use_audio and self.config.image_features and len(self.config.image_features) == 1):
+                raise ValueError("fusion_mode='modality_attention' needs exactly one camera and the audio branch.")
+            if self.use_rgb_binary:
+                raise ValueError("fusion_mode='modality_attention' does not support the RGB binary branch.")
+            rgb_dim = (
+                self.rgb_encoder[0].feature_dim
+                if self.config.use_separate_rgb_encoder_per_camera
+                else self.rgb_encoder.feature_dim
+            )
+            token_dim = rgb_dim * config.n_obs_steps
+            self.fusion_audio_proj = nn.Linear(self.audio_encoder.feature_dim * config.n_obs_steps, token_dim)
+            self.fusion_layer = nn.TransformerEncoderLayer(
+                d_model=token_dim,
+                nhead=config.fusion_num_heads,
+                dim_feedforward=config.fusion_ff_dim,
+                dropout=0.0,
+                batch_first=True,
+            )
+            self.fusion_out_proj = nn.Linear(2 * token_dim, rgb_dim)
+            low_dim = self.config.robot_state_feature.shape[0]
+            if self.config.env_state_feature:
+                low_dim += self.config.env_state_feature.shape[0]
+            unet_global_cond_dim = rgb_dim + low_dim * config.n_obs_steps
+            print(f"global cond dim after modality-attention fusion: {unet_global_cond_dim}")
+
         # U-Net
-        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
+        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=unet_global_cond_dim)
 
         # Scheduler
         if config.compile_model:
@@ -438,6 +467,18 @@ class DiffusionModel(nn.Module):
             # # --- DEBUG START ---
             # print(f"DEBUG: Audio features shape: {audio_feats.shape}")
             # # --- DEBUG END ---
+
+        if self.config.fusion_mode == "modality_attention":
+            # Tokens: [all obs steps' image features, projected audio features] -> (B, 2, token_dim).
+            tokens = torch.stack(
+                [img_features.flatten(start_dim=1), self.fusion_audio_proj(audio_feats.flatten(start_dim=1))],
+                dim=1,
+            )
+            fused = self.fusion_out_proj(self.fusion_layer(tokens).flatten(start_dim=1))
+            low_dim_feats = [batch[OBS_STATE].flatten(start_dim=1)]
+            if self.config.env_state_feature:
+                low_dim_feats.append(batch[OBS_ENV_STATE].flatten(start_dim=1))
+            return torch.cat([fused, *low_dim_feats], dim=-1), all_attn_maps
 
         # Concatenate features then flatten to (B, global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1),all_attn_maps

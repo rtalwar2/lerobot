@@ -158,6 +158,15 @@ class DiffusionConfig(PreTrainedConfig):
     add_intermediate_audio_layer:bool = False
         # --- NEW: Flag to train from scratch ---
     pretrained_audio_weights: bool = True
+    # How the image and audio features enter the U-Net's global conditioning.
+    #   "concat": concatenated with the state, as in Diffusion Policy (the default; old checkpoints).
+    #   "modality_attention": ManiWAV's fusion (Liu et al., 2024, `ManiWAVObsEncoder`): the image
+    #     features of all obs steps form one token, the audio features (projected to the same width)
+    #     the other; one TransformerEncoderLayer attends over the two, and the concatenated outputs
+    #     are projected back to one step's image-feature width before the state is appended.
+    fusion_mode: str = "concat"
+    fusion_num_heads: int = 8
+    fusion_ff_dim: int = 2048
     # --------------------------------------
 
     # --- Encoder initialization from a locally pretrained checkpoint ---
@@ -223,6 +232,9 @@ class DiffusionConfig(PreTrainedConfig):
         
         if self.audio_feature_type not in ["embedding", "classifier"]:
             raise ValueError("audio_feature_type must be 'embedding' or 'classifier'")
+
+        if self.fusion_mode not in ["concat", "modality_attention"]:
+            raise ValueError(f"fusion_mode must be 'concat' or 'modality_attention'. Got {self.fusion_mode}.")
 
         if self.rgb_binary_backbone is not None and not self.rgb_binary_backbone.startswith("resnet"):
             raise ValueError(
