@@ -980,11 +980,13 @@ class DiffusionRgbEncoder(nn.Module):
         dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
-        # self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints,return_attention=True)
-        # --- REPLACE SpatialSoftmax WITH Adaptive Average Pooling ---
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-
-        in_features = feature_map_shape[0]
+        if config.image_pooling == "spatial_softmax":
+            # upstream Diffusion Policy: (x, y) of each learned keypoint, so the feature keeps image positions
+            self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
+            in_features = config.spatial_softmax_num_keypoints * 2
+        else:
+            self.pool = nn.AdaptiveAvgPool2d((1, 1))
+            in_features = feature_map_shape[0]
         # print(feature_map_shape)
         # print(f"in features: {in_features}")
         # # self.feature_dim = config.spatial_softmax_num_keypoints * 2

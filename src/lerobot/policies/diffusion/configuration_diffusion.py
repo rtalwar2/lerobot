@@ -68,6 +68,9 @@ class DiffusionConfig(PreTrainedConfig):
         use_group_norm: Whether to replace batch normalization with group normalization in the backbone.
             The group sizes are set to be about 16 (to be precise, feature_dim // 16).
         spatial_softmax_num_keypoints: Number of keypoints for SpatialSoftmax.
+        image_pooling: How the RGB encoder pools the backbone's feature map: "avg" (global average, the fork's
+            default since the 2026-08 RgbEncoder rework) or "spatial_softmax" (upstream Diffusion Policy: 2-D
+            keypoint coordinates, which keep where things are in the image).
         use_separate_rgb_encoder_per_camera: Whether to use a separate RGB encoder for each camera view.
         down_dims: Feature dimension for each stage of temporal downsampling in the diffusion modeling Unet.
             You may provide a variable number of dimensions, therefore also controlling the degree of
@@ -126,6 +129,7 @@ class DiffusionConfig(PreTrainedConfig):
     pretrained_backbone_weights: str | None = None
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
+    image_pooling: str = "avg"
     use_separate_rgb_encoder_per_camera: bool = False
 
     # Optional RGB binary encoder branch used as extra global conditioning.
@@ -225,6 +229,8 @@ class DiffusionConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
+        if self.image_pooling not in ("avg", "spatial_softmax"):
+            raise ValueError(f"`image_pooling` must be 'avg' or 'spatial_softmax'. Got {self.image_pooling}.")
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
