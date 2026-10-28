@@ -104,6 +104,11 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 revision=revision,
                 **kwargs,
             )
+        # A saved policy carries its own encoder weights; the encoder-init checkpoints (design A) only seed training
+        # and need not exist where the policy is loaded.
+        for field in ("rgb_encoder_init_checkpoint", "audio_encoder_init_checkpoint"):
+            if getattr(config, field, None) is not None:
+                setattr(config, field, None)
         model_id = str(pretrained_name_or_path)
         instance = cls(config, **kwargs)
         if os.path.isdir(model_id):
