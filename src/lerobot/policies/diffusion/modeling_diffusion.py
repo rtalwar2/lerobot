@@ -21,7 +21,6 @@ TODO(alexander-soare):
 """
 
 import math
-from pathlib import Path
 from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -51,12 +50,8 @@ from ..utils import (
     get_output_shape,
     populate_queues,
 )
-from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
-from transformers import ASTForAudioClassification, AutoConfig, ASTModel
 from .configuration_diffusion import DiffusionConfig
 
-# Define the key for your spectrogram
-OBS_AUDIO = "observation.audio.spectogram_values"
 
 class DiffusionPolicy(PreTrainedPolicy):
     """
@@ -104,14 +99,6 @@ class DiffusionPolicy(PreTrainedPolicy):
             self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
         if self.config.env_state_feature:
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
-
-        # --- NEW: Initialize Audio Queue ---
-        # Check if the audio key exists in the input features map 
-        # (Assuming the dataset provides this key)
-        # In LeRobot, features are usually inferred from dataset stats, 
-        # so we check if the key exists in the config's input features implicitly
-        # or simply initialize it if we expect audio.
-        self._queues[OBS_AUDIO] = deque(maxlen=self.config.n_obs_steps)
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
@@ -164,7 +151,6 @@ class DiffusionPolicy(PreTrainedPolicy):
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         # NOTE: It's important that this happens after stacking the images into a single key.
-        # Populate queues (this handles OBS_AUDIO if it's in the batch)
         self._queues = populate_queues(self._queues, batch)
 
         if len(self._queues[ACTION]) == 0:
@@ -206,16 +192,11 @@ class DiffusionModel(nn.Module):
     def __init__(self, config: DiffusionConfig):
         super().__init__()
         self.config = config
-        
-        # --- 1. Robot State ---
+
         # Build observation encoders (depending on which observations are provided).
         global_cond_dim = self.config.robot_state_feature.shape[0]
-        
-        # --- 2. Images ---
         if self.config.image_features:
             num_images = len(self.config.image_features)
-            print(f"num images : {num_images}")
-            print(f"image features = {self.config.image_features}")
             if self.config.use_separate_rgb_encoder_per_camera:
                 encoders = [DiffusionRgbEncoder(config) for _ in range(num_images)]
                 self.rgb_encoder = nn.ModuleList(encoders)
@@ -223,64 +204,11 @@ class DiffusionModel(nn.Module):
             else:
                 self.rgb_encoder = DiffusionRgbEncoder(config)
                 global_cond_dim += self.rgb_encoder.feature_dim * num_images
-        # --- 3. Env State ---
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
 
-        # --- 4. Optional RGB Binary Branch ---
-        # DiffusionRgbBinaryEncoder is currently commented out further down this file, so this branch
-        # cannot be constructed. Fail with an explanation rather than a bare NameError.
-        self.use_rgb_binary = getattr(config, "rgb_binary_backbone", None) is not None
-        if self.use_rgb_binary:
-            raise NotImplementedError(
-                "`rgb_binary_backbone` is set but DiffusionRgbBinaryEncoder is commented out in "
-                "modeling_diffusion.py. Restore the class before enabling this branch."
-            )
+        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
 
-        print(f"global cond dim: {global_cond_dim}" )
-        # --- 5. NEW: Audio / Spectrogram ---
-        # We detect if we need audio encoder based on config or feature presence
-        self.use_audio = getattr(config, "audio_backbone", None) is not None
-        if self.use_audio:
-            self.audio_encoder = DiffusionAudioEncoder(config)
-            global_cond_dim += self.audio_encoder.feature_dim
-        print(f"global cond dim after audio: {global_cond_dim}" )
-
-        self._load_encoder_init_checkpoints()
-
-        unet_global_cond_dim = global_cond_dim * config.n_obs_steps
-        if config.fusion_mode == "modality_attention":
-            # ManiWAV's fusion (see DiffusionConfig.fusion_mode): replaces the image and audio parts
-            # of the conditioning with one fused vector of a single step's image-feature width.
-            if not (self.use_audio and self.config.image_features and len(self.config.image_features) == 1):
-                raise ValueError("fusion_mode='modality_attention' needs exactly one camera and the audio branch.")
-            if self.use_rgb_binary:
-                raise ValueError("fusion_mode='modality_attention' does not support the RGB binary branch.")
-            rgb_dim = (
-                self.rgb_encoder[0].feature_dim
-                if self.config.use_separate_rgb_encoder_per_camera
-                else self.rgb_encoder.feature_dim
-            )
-            token_dim = rgb_dim * config.n_obs_steps
-            self.fusion_audio_proj = nn.Linear(self.audio_encoder.feature_dim * config.n_obs_steps, token_dim)
-            self.fusion_layer = nn.TransformerEncoderLayer(
-                d_model=token_dim,
-                nhead=config.fusion_num_heads,
-                dim_feedforward=config.fusion_ff_dim,
-                dropout=0.0,
-                batch_first=True,
-            )
-            self.fusion_out_proj = nn.Linear(2 * token_dim, rgb_dim)
-            low_dim = self.config.robot_state_feature.shape[0]
-            if self.config.env_state_feature:
-                low_dim += self.config.env_state_feature.shape[0]
-            unet_global_cond_dim = rgb_dim + low_dim * config.n_obs_steps
-            print(f"global cond dim after modality-attention fusion: {unet_global_cond_dim}")
-
-        # U-Net
-        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=unet_global_cond_dim)
-
-        # Scheduler
         if config.compile_model:
             # Compile the U-Net. "reduce-overhead" is preferred for the small-batch repetitive loops
             # common in diffusion inference.
@@ -301,35 +229,6 @@ class DiffusionModel(nn.Module):
             self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
         else:
             self.num_inference_steps = config.num_inference_steps
-
-    def _load_encoder_init_checkpoints(self) -> None:
-        """Initialize encoders from locally pretrained checkpoints, if any are configured.
-
-        Used for the "pretrain an encoder on an auxiliary target, then use it as policy init" variant.
-        Loading is strict on purpose: a checkpoint that silently failed to apply would leave the
-        encoder at its default initialization, which no training curve would reveal.
-        """
-        targets = []
-        if self.config.rgb_encoder_init_checkpoint is not None:
-            if not self.config.image_features:
-                raise ValueError("`rgb_encoder_init_checkpoint` is set but no image features are configured.")
-            modules = (
-                list(self.rgb_encoder)
-                if self.config.use_separate_rgb_encoder_per_camera
-                else [self.rgb_encoder]
-            )
-            targets.append((self.config.rgb_encoder_init_checkpoint, modules))
-        if self.config.audio_encoder_init_checkpoint is not None:
-            if not self.use_audio:
-                raise ValueError("`audio_encoder_init_checkpoint` is set but the audio branch is disabled.")
-            targets.append((self.config.audio_encoder_init_checkpoint, [self.audio_encoder]))
-
-        for checkpoint_path, modules in targets:
-            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            state_dict = checkpoint["encoder_state_dict"]
-            for module in modules:
-                module.load_state_dict(state_dict, strict=True)
-            print(f"initialized {len(modules)} encoder(s) from {checkpoint_path}")
 
     # ========= inference  ============
     def conditional_sample(
@@ -371,23 +270,17 @@ class DiffusionModel(nn.Module):
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         """Encode image features and concatenate them all together along with the state vector."""
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
-        # 1. State
         global_cond_feats = [batch[OBS_STATE]]
-
-        # # --- DEBUG START ---
-        # print(f"DEBUG: Batch Size: {batch_size}, Steps: {n_obs_steps}")
-        # print(f"DEBUG: State shape: {batch[OBS_STATE].shape}")
-        # # --- DEBUG END ---
-
-        # 2. Images
-
         # Extract image features.
         if self.config.image_features:
             if self.config.use_separate_rgb_encoder_per_camera:
                 # Combine batch and sequence dims while rearranging to make the camera index dimension first.
                 images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
                 img_features_list = torch.cat(
-                    [encoder(images) for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)]
+                    [
+                        encoder(images)
+                        for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
+                    ]
                 )
                 # Separate batch and sequence dims back out. The camera index dim gets absorbed into the
                 # feature dim (effectively concatenating the camera features).
@@ -405,78 +298,9 @@ class DiffusionModel(nn.Module):
                     img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
                 )
             global_cond_feats.append(img_features)
-            # # --- DEBUG START ---
-            # print(f"DEBUG: Image features shape: {img_features.shape}")
-            # # --- DEBUG END ---
 
-        # 2b. Optional RGB binary features from the same image observations.
-        if self.use_rgb_binary:
-            if OBS_IMAGES not in batch:
-                raise ValueError(
-                    f"Model is configured with RGB binary branch, but '{OBS_IMAGES}' is missing from the input batch."
-                )
-
-            if self.config.use_separate_rgb_encoder_per_camera:
-                images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
-                binary_probs = [
-                    encoder(images)
-                    for encoder, images in zip(self.rgb_binary_encoder, images_per_camera, strict=True)
-                ]
-                # [n, b*s, 1] -> [b, s, n]
-                stacked_probs = torch.cat(binary_probs, dim=0)
-                rgb_binary_features = einops.rearrange(
-                    stacked_probs, "(n b s) d -> b s (n d)", b=batch_size, s=n_obs_steps
-                )
-            else:
-                flat_images = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
-                flat_probs = self.rgb_binary_encoder(flat_images)
-                rgb_binary_features = einops.rearrange(
-                    flat_probs, "(b s n) d -> b s (n d)", b=batch_size, s=n_obs_steps
-                )
-
-            global_cond_feats.append(rgb_binary_features)
-
-        # 3. Env State
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV_STATE])
-            # # --- DEBUG START ---
-            # print(f"DEBUG: Env State shape: {batch[OBS_ENV_STATE].shape}")
-            # # --- DEBUG END ---
-        # 4. NEW: Audio
-        if self.use_audio:
-            # Check strictly if key exists to prevent shape mismatch error later
-            if OBS_AUDIO not in batch:
-                raise ValueError(
-                    f"Model is configured with audio, but '{OBS_AUDIO}' is missing from the input batch. "
-                    "Ensure your environment wrapper provides this key."
-                )
-            # batch[OBS_AUDIO] shape: (B, S, Time, Freq)
-            # Flatten B and S
-            # torch.Size([32, 2, 3, 298, 128])
-            batch[OBS_AUDIO] = batch[OBS_AUDIO][:,:,0]
-            audio_input = einops.rearrange(batch[OBS_AUDIO], "b s t f -> (b s) t f")
-            
-            # Pass through AST
-            audio_feats = self.audio_encoder(audio_input)
-            
-            # Reshape back to (B, S, Dim)
-            audio_feats = einops.rearrange(audio_feats, "(b s) d -> b s d", b=batch_size, s=n_obs_steps)
-            global_cond_feats.append(audio_feats)
-            # # --- DEBUG START ---
-            # print(f"DEBUG: Audio features shape: {audio_feats.shape}")
-            # # --- DEBUG END ---
-
-        if self.config.fusion_mode == "modality_attention":
-            # Tokens: [all obs steps' image features, projected audio features] -> (B, 2, token_dim).
-            tokens = torch.stack(
-                [img_features.flatten(start_dim=1), self.fusion_audio_proj(audio_feats.flatten(start_dim=1))],
-                dim=1,
-            )
-            fused = self.fusion_out_proj(self.fusion_layer(tokens).flatten(start_dim=1))
-            low_dim_feats = [batch[OBS_STATE].flatten(start_dim=1)]
-            if self.config.env_state_feature:
-                low_dim_feats.append(batch[OBS_ENV_STATE].flatten(start_dim=1))
-            return torch.cat([fused, *low_dim_feats], dim=-1)
 
         # Concatenate features then flatten to (B, global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
@@ -529,6 +353,7 @@ class DiffusionModel(nn.Module):
         horizon = batch[ACTION].shape[1]
         assert horizon == self.config.horizon
         assert n_obs_steps == self.config.n_obs_steps
+
         # Encode image features and concatenate them all together along with the state vector.
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
@@ -575,189 +400,6 @@ class DiffusionModel(nn.Module):
         return loss.mean()
 
 
-# --- NEW CLASS: DiffusionAudioEncoder ---
-def _ast_patch_grid(hf_config) -> tuple[int, int]:
-    """(frequency, time) patch counts for an AST config -- what position_embeddings is sized for."""
-    frequency = (hf_config.num_mel_bins - hf_config.patch_size) // hf_config.frequency_stride + 1
-    time = (hf_config.max_length - hf_config.patch_size) // hf_config.time_stride + 1
-    return frequency, time
-
-
-def _resize_ast_pos_embed(pos_embed: Tensor, src_config, dst_config) -> Tensor:
-    """Adapt AST position embeddings from src_config's max_length to dst_config's.
-
-    Necessary because the AudioSet checkpoints are trained at max_length=1024 while we feed much
-    shorter spectrograms: the patch count changes, so `position_embeddings` no longer matches. The
-    obvious workaround (`from_pretrained(..., ignore_mismatched_sizes=True)`) does NOT rescale them
-    -- it silently re-initializes them at random, handing pretrained transformer blocks position
-    encodings they were never trained with.
-
-    Shrinking takes a centre slice rather than interpolating, following the reference AST
-    implementation: the embeddings encode absolute position in a 10.24s window at a fixed patch
-    stride, and our clips use that same stride, so a contiguous slice keeps the positional scale
-    consistent with pretraining. Interpolating would compress the whole window into fewer frames and
-    change the effective time scale. Growing has no slice to take, so it interpolates.
-    """
-    f_src, t_src = _ast_patch_grid(src_config)
-    f_dst, t_dst = _ast_patch_grid(dst_config)
-
-    # AST prepends a cls and a distillation token, which carry no positional meaning to rescale.
-    n_special = pos_embed.shape[1] - f_src * t_src
-    special, patches = pos_embed[:, :n_special], pos_embed[:, n_special:]
-    embed_dim = patches.shape[-1]
-
-    patches = patches.reshape(1, f_src, t_src, embed_dim).permute(0, 3, 1, 2)  # (1, d, f, t)
-    if t_dst <= t_src:
-        start = t_src // 2 - t_dst // 2
-        patches = patches[:, :, :, start : start + t_dst]
-    else:
-        patches = F.interpolate(patches, size=(f_src, t_dst), mode="bilinear", align_corners=False)
-    if f_dst != patches.shape[2]:
-        patches = F.interpolate(patches, size=(f_dst, patches.shape[3]), mode="bilinear", align_corners=False)
-    patches = patches.permute(0, 2, 3, 1).reshape(1, f_dst * t_dst, embed_dim)
-
-    return torch.cat([special, patches], dim=1)
-
-
-def _load_pretrained_ast(model_class, backbone: str, hf_config, pos_embed_key: str, drop_prefixes=()):
-    """Build `model_class` for `hf_config` and fill it with `backbone`'s pretrained weights.
-
-    The checkpoint is loaded at its own native max_length first, so its position embeddings arrive
-    intact, and only then resized to hf_config's patch count. Raises on any key that does not
-    transfer: max_length is supposed to affect position embeddings and nothing else, so an unmatched
-    key means the checkpoint and the target architecture disagree somewhere we haven't accounted for.
-    `drop_prefixes` covers submodules that are deliberately not transferred (e.g. a classifier head
-    resized by num_labels).
-    """
-    native_config = AutoConfig.from_pretrained(backbone)
-    native_state = model_class.from_pretrained(backbone, config=native_config).state_dict()
-    native_state[pos_embed_key] = _resize_ast_pos_embed(
-        native_state[pos_embed_key], native_config, hf_config
-    )
-    native_state = {
-        key: value
-        for key, value in native_state.items()
-        if not any(key.startswith(prefix) for prefix in drop_prefixes)
-    }
-
-    model = model_class(hf_config)
-    missing, unexpected = model.load_state_dict(native_state, strict=False)
-    missing = [key for key in missing if not any(key.startswith(prefix) for prefix in drop_prefixes)]
-    if missing or unexpected:
-        raise RuntimeError(
-            f"AST weight transfer from {backbone} left keys unmatched "
-            f"(missing={missing}, unexpected={unexpected})."
-        )
-    return model
-
-
-class DiffusionAudioEncoder(nn.Module):
-    """
-    Encodes audio spectrograms using an AST backbone.
-    Supports returning raw embeddings or classification logits (pseudoinstrumentation).
-    """
-    def __init__(self, config: DiffusionConfig):
-        super().__init__()
-        self.config = config
-        
-        # Load Config first to set max_length correctly before model init
-        hf_config = AutoConfig.from_pretrained(config.audio_backbone)
-        hf_config.max_length = config.time_dimension #298
-        self.head = None
-        
-        if config.audio_feature_type == "classifier":
-            self.feature_dim = hf_config.num_labels      
-            
-            if getattr(config, "pretrained_audio_weights", True):
-                self.backbone = _load_pretrained_ast(
-                    ASTForAudioClassification,
-                    config.audio_backbone,
-                    hf_config,
-                    "audio_spectrogram_transformer.embeddings.position_embeddings",
-                    drop_prefixes=("classifier.",),  # task-specific head, resized by num_labels
-                )
-            else:
-                # Initializes with RANDOM weights based on the config architecture
-                self.backbone = ASTForAudioClassification(hf_config)
-                
-        elif config.audio_feature_type == "embedding":
-            # Setup intermediate layer sizes
-            if config.add_intermediate_audio_layer:
-                print("adding intermediate layer")
-                self.feature_dim = 64
-                self.head = nn.Linear(hf_config.hidden_size, 64)
-            else: 
-                self.feature_dim = hf_config.hidden_size
-            
-            # Initialize Backbone
-            if getattr(config, "pretrained_audio_weights", True):
-                self.backbone = _load_pretrained_ast(
-                    ASTModel,
-                    config.audio_backbone,
-                    hf_config,
-                    "embeddings.position_embeddings",
-                )
-            else:
-                # Initializes with RANDOM weights based on the config architecture
-                print("initializing audio backbone with random weights")
-                self.backbone = ASTModel(hf_config)
-
-        self.mean = config.audio_norm_mean
-        self.std = config.audio_norm_std
-        
-        # 4. Freezing Logic
-        # ⚠️ CRITICAL: If training from scratch, you MUST unfreeze it!
-        should_freeze = getattr(config, "freeze_audio_encoder", True)
-        if not getattr(config, "pretrained_audio_weights", True) and should_freeze:
-            print("WARNING: You are initializing from scratch but freeze_audio_encoder is True. Unfreezing automatically!")
-            should_freeze = False
-
-        if should_freeze:
-            self.backbone.requires_grad_(False)
-            print(f"Audio Encoder ({config.audio_feature_type}) is FROZEN.")
-        else:
-            self.backbone.requires_grad_(True)
-            print(f"Audio Encoder ({config.audio_feature_type}) is TRAINING (End-to-End).")
-            
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Args:
-            x: (B, Time, Freq) Spectrogram tensor.
-        Returns:
-            (B, D) Audio feature (embedding or logits).
-        """
-        # 1. Normalize (AST specific normalization from your script)
-        # formula: (x - mean) / (std * 2)
-        x = (x - self.mean) / (self.std * 2.0)
-        
-        # 2. Forward pass through AST
-        # AST expects inputs of shape (batch_size, max_length, num_mel_bins)
-        # It handles the patch embedding internally.
-        outputs = self.backbone(input_values=x)
-        if self.config.audio_feature_type == "classifier":
-            return outputs.logits
-        elif self.config.audio_feature_type == "embedding":
-            embeddings = outputs.pooler_output
-            if self.head is not None:
-                # Experiment: Pseudoinstrumentation (return logits)
-                return self.head(embeddings)
-            else:
-                # Experiment: Raw Embeddings
-                return embeddings
-        
-        # # 3. Get Pooling output (CLS token usually)
-        # # pooler_output shape: (B, 768)
-        # embeddings = outputs.pooler_output
-        
-        # # 4. Optional Classifier
-        # if self.head is not None:
-        #     # Experiment: Pseudoinstrumentation (return logits)
-        #     return self.head(embeddings)
-        # else:
-        #     # Experiment: Raw Embeddings
-        #     return embeddings
-
-        
 class SpatialSoftmax(nn.Module):
     """
     Spatial Soft Argmax operation described in "Deep Spatial Autoencoders for Visuomotor Learning" by Finn et al.
@@ -816,7 +458,7 @@ class SpatialSoftmax(nn.Module):
         """
         if self.nets is not None:
             features = self.nets(features)
-        B, C, H, W = features.shape
+
         # [B, K, H, W] -> [B * K, H * W] where K is number of keypoints
         features = features.reshape(-1, self._in_h * self._in_w)
         # 2d softmax normalization
@@ -829,97 +471,6 @@ class SpatialSoftmax(nn.Module):
         return feature_keypoints
 
 
-# class DiffusionRgbEncoder(nn.Module):
-#     """Encodes an RGB image into a 1D feature vector.
-
-#     Includes the ability to normalize and crop the image first.
-#     """
-
-#     def __init__(self, config: DiffusionConfig):
-#         super().__init__()
-#         # Set up optional preprocessing.
-#         if config.resize_shape is not None:
-#             self.resize = torchvision.transforms.Resize(config.resize_shape)
-#         else:
-#             self.resize = None
-
-#         crop_shape = config.crop_shape
-#         if crop_shape is not None:
-#             self.do_crop = True
-#             # Always use center crop for eval
-#             self.center_crop = torchvision.transforms.CenterCrop(crop_shape)
-#             if config.crop_is_random:
-#                 self.maybe_random_crop = torchvision.transforms.RandomCrop(crop_shape)
-#             else:
-#                 self.maybe_random_crop = self.center_crop
-#         else:
-#             self.do_crop = False
-
-#         # Set up backbone.
-#         backbone_model = getattr(torchvision.models, config.vision_backbone)(
-#             weights=config.pretrained_backbone_weights
-#         )
-#         # Note: This assumes that the layer4 feature map is children()[-3]
-#         # TODO(alexander-soare): Use a safer alternative.
-#         self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
-#         if config.use_group_norm:
-#             if config.pretrained_backbone_weights:
-#                 raise ValueError(
-#                     "You can't replace BatchNorm in a pretrained model without ruining the weights!"
-#                 )
-#             self.backbone = _replace_submodules(
-#                 root_module=self.backbone,
-#                 predicate=lambda x: isinstance(x, nn.BatchNorm2d),
-#                 func=lambda x: nn.GroupNorm(num_groups=x.num_features // 16, num_channels=x.num_features),
-#             )
-
-#         # Set up pooling and final layers.
-#         # Use a dry run to get the feature map shape.
-#         # The dummy shape mirrors the runtime preprocessing order: resize -> crop.
-
-#         # Note: we have a check in the config class to make sure all images have the same shape.
-#         images_shape = next(iter(config.image_features.values())).shape
-#         if config.crop_shape is not None:
-#             dummy_shape_h_w = config.crop_shape
-#         elif config.resize_shape is not None:
-#             dummy_shape_h_w = config.resize_shape
-#         else:
-#             dummy_shape_h_w = images_shape[1:]
-#         dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
-#         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
-
-#         self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints,return_attention=True)
-#         self.feature_dim = config.spatial_softmax_num_keypoints * 2
-#         self.out = nn.Linear(config.spatial_softmax_num_keypoints * 2, self.feature_dim)
-#         self.relu = nn.ReLU()
-
-#     def forward(self, x: Tensor) -> Tensor:
-#         """
-#         Args:
-#             x: (B, C, H, W) image tensor with pixel values in [0, 1].
-#         Returns:
-#             (B, D) image feature.
-#         """
-#         # Preprocess: resize if configured, then crop if configured.
-
-#         if self.resize is not None:
-#             x = self.resize(x)
-#         if self.do_crop:
-#             if self.training:  # noqa: SIM108
-#                 x = self.maybe_random_crop(x)
-#             else:
-#                 # Always use center crop for eval.
-#                 x = self.center_crop(x)
-#         # Extract backbone feature.
-#         fmap = self.backbone(x)
-
-#         keypoints, attn = self.pool(fmap)   # <-- now also receive attention map
-
-#         x = torch.flatten(keypoints, start_dim=1)
-#         # Final linear layer with non-linearity.
-#         x = self.relu(self.out(x))
-#         return x,attn
-
 class DiffusionRgbEncoder(nn.Module):
     """Encodes an RGB image into a 1D feature vector.
 
@@ -929,12 +480,18 @@ class DiffusionRgbEncoder(nn.Module):
     def __init__(self, config: DiffusionConfig):
         super().__init__()
         # Set up optional preprocessing.
-        if config.crop_shape is not None:
+        if config.resize_shape is not None:
+            self.resize = torchvision.transforms.Resize(config.resize_shape)
+        else:
+            self.resize = None
+
+        crop_shape = config.crop_shape
+        if crop_shape is not None:
             self.do_crop = True
             # Always use center crop for eval
-            self.center_crop = torchvision.transforms.CenterCrop(config.crop_shape)
+            self.center_crop = torchvision.transforms.CenterCrop(crop_shape)
             if config.crop_is_random:
-                self.maybe_random_crop = torchvision.transforms.RandomCrop(config.crop_shape)
+                self.maybe_random_crop = torchvision.transforms.RandomCrop(crop_shape)
             else:
                 self.maybe_random_crop = self.center_crop
         else:
@@ -944,12 +501,6 @@ class DiffusionRgbEncoder(nn.Module):
         backbone_model = getattr(torchvision.models, config.vision_backbone)(
             weights=config.pretrained_backbone_weights
         )
-        
-        # for name, module in backbone_model.named_modules():
-        #     if name:  # Skip the empty string which represents the root model
-        #         print(name)
-
-
         # Note: This assumes that the layer4 feature map is children()[-3]
         # TODO(alexander-soare): Use a safer alternative.
         self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
@@ -966,32 +517,22 @@ class DiffusionRgbEncoder(nn.Module):
 
         # Set up pooling and final layers.
         # Use a dry run to get the feature map shape.
-        # The dummy input should take the number of image channels from `config.image_features` and it should
-        # use the height and width from `config.crop_shape` if it is provided, otherwise it should use the
-        # height and width from `config.image_features`.
+        # The dummy shape mirrors the runtime preprocessing order: resize -> crop.
 
         # Note: we have a check in the config class to make sure all images have the same shape.
         images_shape = next(iter(config.image_features.values())).shape
-        dummy_shape_h_w = config.crop_shape if config.crop_shape is not None else images_shape[1:]
+        if config.crop_shape is not None:
+            dummy_shape_h_w = config.crop_shape
+        elif config.resize_shape is not None:
+            dummy_shape_h_w = config.resize_shape
+        else:
+            dummy_shape_h_w = images_shape[1:]
         dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
-        if config.image_pooling == "spatial_softmax":
-            # upstream Diffusion Policy: (x, y) of each learned keypoint, so the feature keeps image positions
-            self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
-            in_features = config.spatial_softmax_num_keypoints * 2
-        else:
-            self.pool = nn.AdaptiveAvgPool2d((1, 1))
-            in_features = feature_map_shape[0]
-        # print(feature_map_shape)
-        # print(f"in features: {in_features}")
-        # # self.feature_dim = config.spatial_softmax_num_keypoints * 2
-        # flattened_feature_map = torch.flatten(feature_map_shape)
-        # self.feature_dim = flattened_feature_map
-        # print(f"feature_map: {flattened_feature_map}")
-        # self.out = nn.Linear(config.spatial_softmax_num_keypoints * 2, self.feature_dim)
-        self.feature_dim = 512
-        self.out = nn.Linear(in_features,512)
+        self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
+        self.feature_dim = config.spatial_softmax_num_keypoints * 2
+        self.out = nn.Linear(config.spatial_softmax_num_keypoints * 2, self.feature_dim)
         self.relu = nn.ReLU()
 
     def forward(self, x: Tensor) -> Tensor:
@@ -1001,7 +542,10 @@ class DiffusionRgbEncoder(nn.Module):
         Returns:
             (B, D) image feature.
         """
-        # Preprocess: maybe crop (if it was set up in the __init__).
+        # Preprocess: resize if configured, then crop if configured.
+
+        if self.resize is not None:
+            x = self.resize(x)
         if self.do_crop:
             if self.training:  # noqa: SIM108
                 x = self.maybe_random_crop(x)
@@ -1009,98 +553,10 @@ class DiffusionRgbEncoder(nn.Module):
                 # Always use center crop for eval.
                 x = self.center_crop(x)
         # Extract backbone feature.
-        fmap = self.backbone(x)
-        pooled = self.pool(fmap)
-
-        x = torch.flatten(pooled, start_dim=1)
+        x = torch.flatten(self.pool(self.backbone(x)), start_dim=1)
         # Final linear layer with non-linearity.
         x = self.relu(self.out(x))
         return x
-
-# class DiffusionRgbBinaryEncoder(nn.Module):
-#     """Encodes an RGB image to a scalar binary signal for global conditioning."""
-
-#     def __init__(self, config: DiffusionConfig):
-#         super().__init__()
-#         self.config = config
-
-#         if config.crop_shape is not None:
-#             self.do_crop = True
-#             self.center_crop = torchvision.transforms.CenterCrop(config.crop_shape)
-#             if config.crop_is_random:
-#                 self.maybe_random_crop = torchvision.transforms.RandomCrop(config.crop_shape)
-#             else:
-#                 self.maybe_random_crop = self.center_crop
-#         else:
-#             self.do_crop = False
-
-#         backbone_name = config.rgb_binary_backbone or config.vision_backbone
-#         backbone_model = getattr(torchvision.models, backbone_name)(
-#             weights=config.rgb_binary_pretrained_backbone_weights
-#         )
-#         # Keep the final FC as the only task-specific layer for binary score prediction.
-#         in_features = backbone_model.fc.in_features
-#         backbone_model.fc = nn.Linear(in_features, 1)
-#         self.backbone = backbone_model
-#         self.feature_dim = 1
-
-#         checkpoint_path = getattr(config, "rgb_binary_checkpoint_path", None)
-#         if checkpoint_path:
-#             checkpoint_path = Path(checkpoint_path)
-#             if not checkpoint_path.exists():
-#                 raise ValueError(f"RGB binary checkpoint path does not exist: {checkpoint_path}")
-#             checkpoint = torch.load(checkpoint_path, map_location="cpu")
-#             state_dict = checkpoint.get("state_dict", checkpoint)
-#             if not isinstance(state_dict, dict):
-#                 raise ValueError(
-#                     "RGB binary checkpoint must be a state dict or a dict containing a 'state_dict' key."
-#                 )
-
-#             # Support checkpoints saved from wrapped modules.
-#             state_dict = {
-#                 k.replace("module.", "", 1) if k.startswith("module.") else k: v
-#                 for k, v in state_dict.items()
-#             }
-#             load_result = self.backbone.load_state_dict(state_dict, strict=False)
-#             print(
-#                 "Loaded RGB binary checkpoint",
-#                 f"missing_keys={len(load_result.missing_keys)}",
-#                 f"unexpected_keys={len(load_result.unexpected_keys)}",
-#             )
-
-#         self.mean = config.rgb_binary_norm_mean
-#         self.std = config.rgb_binary_norm_std
-
-#         if getattr(config, "freeze_rgb_binary_encoder", True):
-#             self.backbone.requires_grad_(False)
-#             print("RGB binary encoder is FROZEN.")
-#         else:
-#             self.backbone.requires_grad_(True)
-#             print("RGB binary encoder is TRAINING (End-to-End).")
-
-#     def forward(self, x: Tensor) -> Tensor:
-#         """
-#         Args:
-#             x: (B, C, H, W) image tensor with pixel values in [0, 1].
-#         Returns:
-#             (B, 1) scalar signal per image for conditioning.
-#         """
-#         if self.do_crop:
-#             if self.training:
-#                 x = self.maybe_random_crop(x)
-#             else:
-#                 x = self.center_crop(x)
-
-#         # Avoid division by zero if normalization std is accidentally set to 0.
-#         denom = max(self.std, 1e-6)
-#         x = (x - self.mean) / denom
-
-#         logits = self.backbone(x)
-#         probs = torch.sigmoid(logits)
-
-#         if self.config.rgb_binary_output_type == "thresholded":
-#             return (probs >= self.config.rgb_binary_threshold).float()
-#         return probs
 
 
 def _replace_submodules(

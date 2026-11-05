@@ -38,7 +38,7 @@ from collections.abc import Callable, Iterable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Generic, TypedDict, TypeVar, cast
+from typing import Any, TypedDict, TypeVar, cast
 
 import torch
 from huggingface_hub import hf_hub_download
@@ -258,7 +258,7 @@ class ProcessorMigrationError(Exception):
 
 
 @dataclass
-class DataProcessorPipeline(HubMixin, Generic[TInput, TOutput]):
+class DataProcessorPipeline[TInput, TOutput](HubMixin):
     """A sequential pipeline for processing data, integrated with the Hugging Face Hub.
 
     This class chains together multiple `ProcessorStep` instances to form a complete

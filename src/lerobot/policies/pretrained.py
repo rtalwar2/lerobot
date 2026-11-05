@@ -202,6 +202,9 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         for field in ("rgb_encoder_init_checkpoint", "audio_encoder_init_checkpoint"):
             if getattr(config, field, None) is not None:
                 setattr(config, field, None)
+        # Likewise generic pretrained weights (e.g. diffusion_audio's AudioSet AST) are overwritten by the
+        # checkpoint right below, so the model need not download them (not a config field: never saved).
+        config._weights_from_checkpoint = True
         model_id = str(pretrained_name_or_path)
         instance = cls(config, **kwargs)
         if os.path.isdir(model_id):

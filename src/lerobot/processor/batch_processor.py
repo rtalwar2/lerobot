@@ -117,6 +117,12 @@ class AddBatchDimensionObservationStep(ObservationProcessorStep):
         for key, value in observation.items():
             if key.startswith(f"{OBS_IMAGES}.") and isinstance(value, Tensor) and value.dim() == 3:
                 observation[key] = value.unsqueeze(0)
+
+        # audio fork: spectrograms are recorded per frame as (channels, time, freq) -- add the batch dim
+        # (also to a single-channel (time, freq) one)
+        for key, value in observation.items():
+            if key.startswith("observation.audio") and isinstance(value, Tensor) and value.dim() in (2, 3):
+                observation[key] = value.unsqueeze(0)
         return observation
 
     def transform_features(

@@ -20,11 +20,11 @@ from enum import Enum
 class FeatureType(str, Enum):
     STATE = "STATE"
     VISUAL = "VISUAL"
-    AUDIO = "AUDIO"
     ENV = "ENV"
     ACTION = "ACTION"
     REWARD = "REWARD"
     LANGUAGE = "LANGUAGE"
+    AUDIO = "AUDIO"  # audio fork: spectrograms (diffusion_audio policy)
 
 
 class PipelineFeatureType(str, Enum):
@@ -34,8 +34,8 @@ class PipelineFeatureType(str, Enum):
 
 class NormalizationMode(str, Enum):
     MIN_MAX = "MIN_MAX"
-    IDENTITY = "IDENTITY"
     MEAN_STD = "MEAN_STD"
+    IDENTITY = "IDENTITY"
     QUANTILES = "QUANTILES"
     QUANTILE10 = "QUANTILE10"
 

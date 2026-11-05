@@ -606,13 +606,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
-        # audio fork: features stored as 1-D per frame arrive as (B, D); the diffusion policy expects (B, D, 1)
-        state = batch["observation.state"]
-        action = batch["action"]
-        if state.ndim == 2:
-            batch["observation.state"] = batch["observation.state"].unsqueeze(-1)
-        if action.ndim == 2:
-            batch["action"] = batch["action"].unsqueeze(-1)
+
         train_tracker, _ = update_policy(
             train_tracker,
             policy,

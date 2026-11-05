@@ -240,8 +240,6 @@ def validate_visual_features_consistency(
     """
     expected_visuals = {k for k, v in cfg.input_features.items() if v.type == FeatureType.VISUAL}
     provided_visuals = {k for k, v in features.items() if v.type == FeatureType.VISUAL}
-    print(f"provided visuals : {provided_visuals}")
-    print(f"expected_visuals visuals : {expected_visuals}")
 
     # Accept if either direction is a subset
     policy_subset_of_dataset = expected_visuals.issubset(provided_visuals)

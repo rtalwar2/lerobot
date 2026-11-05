@@ -204,7 +204,9 @@ intelrealsense = [
 phone = ["hebi-py>=2.8.0,<2.12.0", "teleop>=0.1.0,<0.2.0", "fastapi<1.0", "lerobot[scipy-dep]"]
 
 # Policies
-diffusion = ["lerobot[diffusers-dep]", "lerobot[transformers-dep]"]  # audio fork: the AST audio encoder (transformers)
+diffusion = ["lerobot[diffusers-dep]"]
+# audio fork: diffusion policy with an AST audio encoder (transformers), see policies/diffusion_audio
+diffusion_audio = ["lerobot[diffusers-dep]", "lerobot[transformers-dep]"]
 wallx = [
     "lerobot[transformers-dep]",
     "lerobot[peft-dep]",
@@ -310,6 +312,7 @@ all = [
     "lerobot[kinematics]",
     "lerobot[intelrealsense]",
     "lerobot[diffusion]",
+    "lerobot[diffusion_audio]",
     "lerobot[multi_task_dit]",
     "lerobot[wallx]",
     "lerobot[pi]",

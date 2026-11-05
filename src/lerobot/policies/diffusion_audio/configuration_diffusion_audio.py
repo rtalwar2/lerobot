@@ -1,0 +1,379 @@
+#!/usr/bin/env python
+
+# Copyright 2024 Columbia Artificial Intelligence, Robotics Lab,
+# and The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from dataclasses import dataclass, field
+
+from lerobot.configs import NormalizationMode, PreTrainedConfig
+from lerobot.optim import AdamConfig, DiffuserSchedulerConfig
+
+# the spectrogram observation key (as recorded by robot-imitation-glue from SensorCommDDS)
+OBS_AUDIO = "observation.audio.spectogram_values"
+
+
+@PreTrainedConfig.register_subclass("diffusion_audio")
+@dataclass
+class DiffusionAudioConfig(PreTrainedConfig):
+    """Configuration class for DiffusionPolicy.
+
+    Defaults are configured for training with PushT providing proprioceptive and single camera observations.
+
+    The parameters you will most likely need to change are the ones which depend on the environment / sensors.
+    Those are: `input_features` and `output_features`.
+
+    Notes on the inputs and outputs:
+        - "observation.state" is required as an input key.
+        - Either:
+            - At least one key starting with "observation.image is required as an input.
+              AND/OR
+            - The key "observation.environment_state" is required as input.
+        - If there are multiple keys beginning with "observation.image" they are treated as multiple camera
+          views. Right now we only support all images having the same shape.
+        - "action" is required as an output key.
+
+    Args:
+        n_obs_steps: Number of environment steps worth of observations to pass to the policy (takes the
+            current step and additional steps going back).
+        horizon: Diffusion model action prediction size as detailed in `DiffusionPolicy.select_action`.
+        n_action_steps: The number of action steps to run in the environment for one invocation of the policy.
+            See `DiffusionPolicy.select_action` for more details.
+        input_features: A dictionary defining the PolicyFeature of the input data for the policy. The key represents
+            the input data name, and the value is PolicyFeature, which consists of FeatureType and shape attributes.
+        output_features: A dictionary defining the PolicyFeature of the output data for the policy. The key represents
+            the output data name, and the value is PolicyFeature, which consists of FeatureType and shape attributes.
+        normalization_mapping: A dictionary that maps from a str value of FeatureType (e.g., "STATE", "VISUAL") to
+            a corresponding NormalizationMode (e.g., NormalizationMode.MIN_MAX)
+        vision_backbone: Name of the torchvision resnet backbone to use for encoding images.
+        resize_shape: (H, W) shape to resize images to as a preprocessing step for the vision
+            backbone. If None, no resizing is done and the original image resolution is used.
+        crop_ratio: Ratio in (0, 1] used to derive the crop size from resize_shape
+            (crop_h = int(resize_shape[0] * crop_ratio), likewise for width).
+            Set to 1.0 to disable cropping. Only takes effect when resize_shape is not None.
+        crop_shape: (H, W) shape to crop images to. When resize_shape is set and crop_ratio < 1.0,
+            this is computed automatically. Can also be set directly for legacy configs that use
+            crop-only (without resize). If None and no derivation applies, no cropping is done.
+        crop_is_random: Whether the crop should be random at training time (it's always a center
+            crop in eval mode).
+        pretrained_backbone_weights: Pretrained weights from torchvision to initialize the backbone.
+            `None` means no pretrained weights.
+        use_group_norm: Whether to replace batch normalization with group normalization in the backbone.
+            The group sizes are set to be about 16 (to be precise, feature_dim // 16).
+        spatial_softmax_num_keypoints: Number of keypoints for SpatialSoftmax.
+        image_pooling: How the RGB encoder pools the backbone's feature map: "avg" (global average, the fork's
+            default since the 2026-08 RgbEncoder rework) or "spatial_softmax" (upstream Diffusion Policy: 2-D
+            keypoint coordinates, which keep where things are in the image).
+        use_separate_rgb_encoder_per_camera: Whether to use a separate RGB encoder for each camera view.
+        down_dims: Feature dimension for each stage of temporal downsampling in the diffusion modeling Unet.
+            You may provide a variable number of dimensions, therefore also controlling the degree of
+            downsampling.
+        kernel_size: The convolutional kernel size of the diffusion modeling Unet.
+        n_groups: Number of groups used in the group norm of the Unet's convolutional blocks.
+        diffusion_step_embed_dim: The Unet is conditioned on the diffusion timestep via a small non-linear
+            network. This is the output dimension of that network, i.e., the embedding dimension.
+        use_film_scale_modulation: FiLM (https://huggingface.co/papers/1709.07871) is used for the Unet conditioning.
+            Bias modulation is used be default, while this parameter indicates whether to also use scale
+            modulation.
+        gradient_checkpointing: Whether to checkpoint the Unet residual blocks during training. This reduces
+            activation memory at the cost of recomputing those blocks during the backward pass.
+        noise_scheduler_type: Name of the noise scheduler to use. Supported options: ["DDPM", "DDIM"].
+        num_train_timesteps: Number of diffusion steps for the forward diffusion schedule.
+        beta_schedule: Name of the diffusion beta schedule as per DDPMScheduler from Hugging Face diffusers.
+        beta_start: Beta value for the first forward-diffusion step.
+        beta_end: Beta value for the last forward-diffusion step.
+        prediction_type: The type of prediction that the diffusion modeling Unet makes. Choose from "epsilon"
+            or "sample". These have equivalent outcomes from a latent variable modeling perspective, but
+            "epsilon" has been shown to work better in many deep neural network settings.
+        clip_sample: Whether to clip the sample to [-`clip_sample_range`, +`clip_sample_range`] for each
+            denoising step at inference time. WARNING: you will need to make sure your action-space is
+            normalized to fit within this range.
+        clip_sample_range: The magnitude of the clipping range as described above.
+        num_inference_steps: Number of reverse diffusion steps to use at inference time (steps are evenly
+            spaced). If not provided, this defaults to be the same as `num_train_timesteps`.
+        do_mask_loss_for_padding: Whether to mask the loss when there are copy-padded actions. See
+            `LeRobotDataset` and `load_previous_and_future_frames` for more information. Note, this defaults
+            to False as the original Diffusion Policy implementation does the same.
+    """
+
+    # Inputs / output structure.
+    n_obs_steps: int = 2
+    horizon: int = 64
+    n_action_steps: int = 32
+
+    normalization_mapping: dict[str, NormalizationMode] = field(
+        default_factory=lambda: {
+            "VISUAL": NormalizationMode.MEAN_STD,
+            "STATE": NormalizationMode.MIN_MAX,
+            "ACTION": NormalizationMode.MIN_MAX,
+            "AUDIO": NormalizationMode.IDENTITY
+        }
+    )
+
+    # The original implementation doesn't sample frames for the last 7 steps,
+    # which avoids excessive padding and leads to improved training results.
+    drop_n_last_frames: int = 7  # horizon - n_action_steps - n_obs_steps + 1
+
+    # Architecture / modeling.
+    # Vision backbone.
+    vision_backbone: str = "resnet18"
+    resize_shape: tuple[int, int] | None = None
+    crop_ratio: float = 1.0
+    crop_shape: tuple[int, int] | None = None
+    crop_is_random: bool = True
+    pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
+    use_group_norm: bool = False
+    spatial_softmax_num_keypoints: int = 32
+    image_pooling: str = "avg"
+    # audio fork: False (v0.6.1's default is True); the fork's RgbEncoder rework was written and trained with False
+    use_separate_rgb_encoder_per_camera: bool = False
+
+    # Optional RGB binary encoder branch used as extra global conditioning.
+    # Set to None to disable this branch.
+    rgb_binary_backbone: str | None = None
+    # Optional pretrained weights enum for torchvision backbone construction.
+    rgb_binary_pretrained_backbone_weights: str | None = None
+    # Optional local checkpoint path for a separately pretrained RGB binary model.
+    rgb_binary_checkpoint_path: str | None = None
+    rgb_binary_norm_mean: float = 0.0
+    rgb_binary_norm_std: float = 1.0
+    freeze_rgb_binary_encoder: bool = True
+    # Global conditioning can use probability (default) or thresholded binary output.
+    rgb_binary_output_type: str = "probability"
+    rgb_binary_threshold: float = 0.5
+
+
+    # --- NEW: Audio / AST Configuration ---
+    # Name of the HuggingFace checkpoint
+    audio_backbone: str | None = "MIT/ast-finetuned-audioset-10-10-0.4593" 
+    # Provided by your training script
+    audio_norm_mean: float = 0.0 
+    audio_norm_std: float = 1.0
+    # If "embedding", we use the AST CLS token/Pooler (768 dim).
+    # If "classifier", we add a head to predict logits (num_audio_classes dim).
+    audio_feature_type: str = "embedding" 
+    # num_audio_classes: int = 2 #this will always be frozen from pretrained model
+    time_dimension:int = 298
+    freeze_audio_encoder:bool = True
+    add_intermediate_audio_layer:bool = False
+        # --- NEW: Flag to train from scratch ---
+    pretrained_audio_weights: bool = True
+    # How the image and audio features enter the U-Net's global conditioning.
+    #   "concat": concatenated with the state, as in Diffusion Policy (the default; old checkpoints).
+    #   "modality_attention": ManiWAV's fusion (Liu et al., 2024, `ManiWAVObsEncoder`): the image
+    #     features of all obs steps form one token, the audio features (projected to the same width)
+    #     the other; one TransformerEncoderLayer attends over the two, and the concatenated outputs
+    #     are projected back to one step's image-feature width before the state is appended.
+    fusion_mode: str = "concat"
+    fusion_num_heads: int = 8
+    fusion_ff_dim: int = 2048
+    # --------------------------------------
+
+    # --- Encoder initialization from a locally pretrained checkpoint ---
+    # Paths to checkpoints holding an {"encoder_state_dict": ...} produced by pretraining the
+    # corresponding encoder class on an auxiliary target (e.g. an instrumentation signal). Applied
+    # after the encoders are constructed, so the checkpoint must come from an encoder built with
+    # THIS SAME config -- the load is strict and will fail loudly otherwise.
+    # Distinct from `pretrained_backbone_weights` / `pretrained_audio_weights`, which select generic
+    # ImageNet / AudioSet weights; keeping them separate means a config still says which it uses.
+    rgb_encoder_init_checkpoint: str | None = None
+    audio_encoder_init_checkpoint: str | None = None
+
+    # Spectrogram channel the AST encodes when the observation has a channel axis (B, S, C, T, F).
+    audio_channel: int = 0
+    # The AST architecture config (transformers ASTConfig.to_dict()), filled in when the policy is first
+    # built and saved with it, so a trained policy can be loaded without the Hugging Face Hub.
+    audio_backbone_config: dict | None = None
+
+
+    # Unet.
+    down_dims: tuple[int, ...] = (512, 1024, 2048)
+    kernel_size: int = 5
+    n_groups: int = 8
+    diffusion_step_embed_dim: int = 128
+    use_film_scale_modulation: bool = True
+    gradient_checkpointing: bool = False
+    # Noise scheduler.
+    noise_scheduler_type: str = "DDPM"
+    num_train_timesteps: int = 100
+    beta_schedule: str = "squaredcos_cap_v2"
+    beta_start: float = 0.0001
+    beta_end: float = 0.02
+    prediction_type: str = "epsilon"
+    clip_sample: bool = True
+    clip_sample_range: float = 1.0
+
+    # Inference
+    num_inference_steps: int | None = None
+
+    # Optimization
+    compile_model: bool = False
+    compile_mode: str = "reduce-overhead"
+
+    # Loss computation
+    do_mask_loss_for_padding: bool = False
+    # UMI-style relative actions: the dataset's action is an ABSOLUTE end-effector target [xyz, rot6d(6)] and
+    # observation.state starts with [xyz, extrinsic-xyz euler]; the preprocessor re-expresses every action of a
+    # chunk in the frame of the latest observed pose (SE3RelativeActionsProcessorStep). The dataset's action
+    # stats must then describe the RELATIVE actions. Inference callers convert the output back to absolute
+    # themselves (lerobot.processor.relative_to_absolute_pose_actions) with the pose the chunk was predicted
+    # from -- see se3_relative_action_processor.py for why this is not a postprocessor step.
+    use_relative_actions: bool = False
+
+    # Training presets
+    optimizer_lr: float = 1e-4
+    optimizer_betas: tuple = (0.95, 0.999)
+    optimizer_eps: float = 1e-8
+    optimizer_weight_decay: float = 1e-6
+    scheduler_name: str = "cosine"
+    scheduler_warmup_steps: int = 500
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        """Input validation (not exhaustive)."""
+        if self.image_pooling not in ("avg", "spatial_softmax"):
+            raise ValueError(f"`image_pooling` must be 'avg' or 'spatial_softmax'. Got {self.image_pooling}.")
+        if not self.vision_backbone.startswith("resnet"):
+            raise ValueError(
+                f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
+            )
+        
+        if self.audio_feature_type not in ["embedding", "classifier"]:
+            raise ValueError("audio_feature_type must be 'embedding' or 'classifier'")
+
+        if self.fusion_mode not in ["concat", "modality_attention"]:
+            raise ValueError(f"fusion_mode must be 'concat' or 'modality_attention'. Got {self.fusion_mode}.")
+
+        if self.rgb_binary_backbone is not None and not self.rgb_binary_backbone.startswith("resnet"):
+            raise ValueError(
+                "`rgb_binary_backbone` must be one of the ResNet variants when enabled. "
+                f"Got {self.rgb_binary_backbone}."
+            )
+
+        supported_rgb_binary_output_types = ["probability", "thresholded"]
+        if self.rgb_binary_output_type not in supported_rgb_binary_output_types:
+            raise ValueError(
+                "`rgb_binary_output_type` must be one of "
+                f"{supported_rgb_binary_output_types}. Got {self.rgb_binary_output_type}."
+            )
+        if not 0.0 <= self.rgb_binary_threshold <= 1.0:
+            raise ValueError(
+                f"`rgb_binary_threshold` must be in [0, 1]. Got {self.rgb_binary_threshold}."
+            )
+
+        supported_prediction_types = ["epsilon", "sample"]
+        if self.prediction_type not in supported_prediction_types:
+            raise ValueError(
+                f"`prediction_type` must be one of {supported_prediction_types}. Got {self.prediction_type}."
+            )
+        supported_noise_schedulers = ["DDPM", "DDIM"]
+        if self.noise_scheduler_type not in supported_noise_schedulers:
+            raise ValueError(
+                f"`noise_scheduler_type` must be one of {supported_noise_schedulers}. "
+                f"Got {self.noise_scheduler_type}."
+            )
+
+        if self.rgb_binary_backbone is not None:
+            raise NotImplementedError(
+                "`rgb_binary_backbone` is set, but DiffusionRgbBinaryEncoder is commented out in "
+                "modeling_diffusion_audio.py: restore it before enabling this branch."
+            )
+        if self.resize_shape is not None:
+            raise NotImplementedError(
+                "`resize_shape` is not applied by this policy's RGB encoder (only the upstream `diffusion` policy "
+                "resizes): resize the images when preparing the dataset, or use `crop_shape`."
+            )
+        if self.resize_shape is not None and (
+            len(self.resize_shape) != 2 or any(d <= 0 for d in self.resize_shape)
+        ):
+            raise ValueError(f"`resize_shape` must be a pair of positive integers. Got {self.resize_shape}.")
+        if not (0 < self.crop_ratio <= 1.0):
+            raise ValueError(f"`crop_ratio` must be in (0, 1]. Got {self.crop_ratio}.")
+
+        if self.resize_shape is not None:
+            if self.crop_ratio < 1.0:
+                self.crop_shape = (
+                    int(self.resize_shape[0] * self.crop_ratio),
+                    int(self.resize_shape[1] * self.crop_ratio),
+                )
+            else:
+                # Explicitly disable cropping for resize+ratio path when crop_ratio == 1.0.
+                self.crop_shape = None
+        if self.crop_shape is not None and (self.crop_shape[0] <= 0 or self.crop_shape[1] <= 0):
+            raise ValueError(f"`crop_shape` must have positive dimensions. Got {self.crop_shape}.")
+
+        # Check that the horizon size and U-Net downsampling is compatible.
+        # U-Net downsamples by 2 with each stage.
+        downsampling_factor = 2 ** len(self.down_dims)
+        if self.horizon % downsampling_factor != 0:
+            raise ValueError(
+                "The horizon should be an integer multiple of the downsampling factor (which is determined "
+                f"by `len(down_dims)`). Got {self.horizon=} and {self.down_dims=}"
+            )
+
+    def get_optimizer_preset(self) -> AdamConfig:
+        return AdamConfig(
+            lr=self.optimizer_lr,
+            betas=self.optimizer_betas,
+            eps=self.optimizer_eps,
+            weight_decay=self.optimizer_weight_decay,
+        )
+
+    def get_scheduler_preset(self) -> DiffuserSchedulerConfig:
+        return DiffuserSchedulerConfig(
+            name=self.scheduler_name,
+            num_warmup_steps=self.scheduler_warmup_steps,
+        )
+
+    def validate_features(self) -> None:
+        has_audio = OBS_AUDIO in self.input_features
+        if self.audio_backbone is not None and not has_audio:
+            raise ValueError(
+                f"`audio_backbone` is set but '{OBS_AUDIO}' is not an input feature. Declare it (type AUDIO, "
+                "normalization IDENTITY: the audio encoder normalizes with audio_norm_mean/std) or set "
+                "audio_backbone=None for an image-only policy."
+            )
+        if has_audio and self.audio_backbone is None:
+            raise ValueError(f"'{OBS_AUDIO}' is an input feature but `audio_backbone` is None.")
+        if len(self.image_features) == 0 and self.env_state_feature is None:
+            raise ValueError("You must provide at least one image or the environment state among the inputs.")
+
+        if self.resize_shape is None and self.crop_shape is not None:
+            for key, image_ft in self.image_features.items():
+                if self.crop_shape[0] > image_ft.shape[1] or self.crop_shape[1] > image_ft.shape[2]:
+                    raise ValueError(
+                        f"`crop_shape` should fit within the image shapes. Got {self.crop_shape} "
+                        f"for `crop_shape` and {image_ft.shape} for `{key}`."
+                    )
+
+        # Check that all input images have the same shape.
+        if len(self.image_features) > 0:
+            first_image_key, first_image_ft = next(iter(self.image_features.items()))
+            for key, image_ft in self.image_features.items():
+                if image_ft.shape != first_image_ft.shape:
+                    raise ValueError(
+                        f"`{key}` does not match `{first_image_key}`, but we expect all image shapes to match."
+                    )
+
+    @property
+    def observation_delta_indices(self) -> list:
+        return list(range(1 - self.n_obs_steps, 1))
+
+    @property
+    def action_delta_indices(self) -> list:
+        return list(range(1 - self.n_obs_steps, 1 - self.n_obs_steps + self.horizon))
+
+    @property
+    def reward_delta_indices(self) -> None:
+        return None
