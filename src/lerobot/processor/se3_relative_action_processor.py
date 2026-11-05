@@ -33,7 +33,7 @@ import torch
 from torch import Tensor
 
 from lerobot.configs import PipelineFeatureType, PolicyFeature
-from lerobot.types import EnvTransition, TransitionKey
+from lerobot.lerobot_types import EnvTransition, TransitionKey
 from lerobot.utils.constants import OBS_STATE
 
 from .pipeline import ProcessorStep, ProcessorStepRegistry

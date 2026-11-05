@@ -19,18 +19,12 @@ from typing import Any
 import torch
 
 from lerobot.processor import (
-    AddBatchDimensionProcessorStep,
-    DeviceProcessorStep,
-    NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
-    RenameObservationsProcessorStep,
     SE3RelativeActionsProcessorStep,
-    UnnormalizerProcessorStep,
-    policy_action_to_transition,
-    transition_to_policy_action,
+    make_default_policy_processor_steps,
+    make_policy_processor_pipelines,
 )
-from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 from .configuration_diffusion import DiffusionConfig
 
@@ -64,34 +58,11 @@ def make_diffusion_pre_post_processors(
     Returns:
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
-
-    input_steps = [
-        RenameObservationsProcessorStep(rename_map={}),
-        AddBatchDimensionProcessorStep(),
-        DeviceProcessorStep(device=config.device),
-        # absolute -> relative pose actions, on the raw (unnormalized) state; a no-op without an action
-        SE3RelativeActionsProcessorStep(enabled=getattr(config, "use_relative_actions", False)),
-        NormalizerProcessorStep(
-            features={**config.input_features, **config.output_features},
-            norm_map=config.normalization_mapping,
-            stats=dataset_stats,
-        ),
-    ]
-    output_steps = [
-        UnnormalizerProcessorStep(
-            features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
-        ),
-        DeviceProcessorStep(device="cpu"),
-    ]
-    return (
-        PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
-            steps=input_steps,
-            name=POLICY_PREPROCESSOR_DEFAULT_NAME,
-        ),
-        PolicyProcessorPipeline[PolicyAction, PolicyAction](
-            steps=output_steps,
-            name=POLICY_POSTPROCESSOR_DEFAULT_NAME,
-            to_transition=policy_action_to_transition,
-            to_output=transition_to_policy_action,
-        ),
+    s = make_default_policy_processor_steps(config, dataset_stats)
+    # use_relative_actions: absolute -> relative pose actions on the raw (unnormalized) state, before the
+    # normalizer; only inserted when enabled, so the default pipeline (and saved checkpoints) are unchanged
+    relative_steps = [SE3RelativeActionsProcessorStep(enabled=True)] if config.use_relative_actions else []
+    return make_policy_processor_pipelines(
+        input_steps=[s.rename_observations, s.add_batch_dim, s.to_device, *relative_steps, s.normalize],
+        output_steps=[s.unnormalize, s.to_cpu],
     )
