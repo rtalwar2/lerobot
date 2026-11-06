@@ -161,6 +161,10 @@ class DiffusionConfig(PreTrainedConfig):
     # themselves (lerobot.processor.relative_to_absolute_pose_actions) with the pose the chunk was predicted
     # from -- see se3_relative_action_processor.py for why this is not a postprocessor step.
     use_relative_actions: bool = False
+    # Where the reference pose of the relative actions comes from. None: the first 6 dims of observation.state as
+    # [xyz, extrinsic-xyz euler] (above). A key (e.g. "observation.eef_pose"): that observation as [xyz, rot6d] --
+    # no Euler angles. The policy does not read that key (it may still be listed in input_features).
+    relative_actions_reference_key: str | None = None
 
     # Training presets
     optimizer_lr: float = 1e-4
@@ -172,6 +176,8 @@ class DiffusionConfig(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.relative_actions_reference_key is not None and not self.use_relative_actions:
+            raise ValueError("`relative_actions_reference_key` is set but `use_relative_actions` is False.")
 
         """Input validation (not exhaustive)."""
         if not self.vision_backbone.startswith("resnet"):
