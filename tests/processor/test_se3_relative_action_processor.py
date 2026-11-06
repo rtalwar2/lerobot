@@ -218,6 +218,9 @@ def test_step_reads_the_reference_pose_key_and_needs_it():
     converted = step(create_transition({OBS_STATE: torch.zeros(2, 5), OBS_EEF_POSE: pose}, actions))
     torch.testing.assert_close(converted[ACTION], absolute_to_relative_pose_actions(actions, state))
     assert step.get_config() == {"enabled": True, "reference_pose_key": OBS_EEF_POSE}
+    assert SE3RelativeActionsProcessorStep(enabled=True).get_config() == {
+        "enabled": True
+    }  # loadable by old versions
     with pytest.raises(KeyError, match=OBS_EEF_POSE):
         step(create_transition({OBS_STATE: state}, actions))
     assert (

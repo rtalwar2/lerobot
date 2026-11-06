@@ -163,7 +163,7 @@ class DiffusionConfig(PreTrainedConfig):
     use_relative_actions: bool = False
     # Where the reference pose of the relative actions comes from. None: the first 6 dims of observation.state as
     # [xyz, extrinsic-xyz euler] (above). A key (e.g. "observation.eef_pose"): that observation as [xyz, rot6d] --
-    # no Euler angles, and the absolute pose need not be a policy input (leave it out of input_features).
+    # no Euler angles. The policy does not read that key (it may still be listed in input_features).
     relative_actions_reference_key: str | None = None
 
     # Training presets

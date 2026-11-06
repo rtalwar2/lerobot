@@ -19,9 +19,10 @@ Layouts (fixed, documented here rather than configurable):
     None (default)   the first 6 dims of observation.state, [x, y, z, rx, ry, rz]: position and EXTRINSIC xyz
                      Euler angles (scipy "xyz", the convention airo-spatial-algebra's SE3Container uses).
     a key, e.g. "observation.eef_pose"   that observation, [x, y, z, r1(3), r2(3)] (..., 9): position and 6D
-                     rotation, like the actions. The pose then does not have to be a policy input at all (it is
-                     not in the policy's input features, the policy never sees it), and there are no Euler angles
-                     anywhere: no wrap-around at +-pi, no gimbal lock. The policy's state can then carry a
+                     rotation, like the actions. The policy does not read this key (diffusion conditions on
+                     observation.state and the images only; if input_features are inferred from the dataset it is
+                     listed there and normalized, which is harmless: this step uses the raw pose, before the
+                     normalizer), and there are no Euler angles anywhere: no wrap-around at +-pi, no gimbal lock. The policy's state can then carry a
                      relative proprioception instead (UMI: past poses in the frame of the current one).
 
 Only the training half lives in the processor pipeline. The inverse (relative -> absolute) is NOT done in a
@@ -165,7 +166,11 @@ class SE3RelativeActionsProcessorStep(ProcessorStep):
         return new_transition
 
     def get_config(self) -> dict[str, Any]:
-        return {"enabled": self.enabled, "reference_pose_key": self.reference_pose_key}
+        # the key only when set: a pipeline without one stays loadable by versions that predate the field
+        config: dict[str, Any] = {"enabled": self.enabled}
+        if self.reference_pose_key is not None:
+            config["reference_pose_key"] = self.reference_pose_key
+        return config
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
