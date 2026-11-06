@@ -25,6 +25,7 @@ from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.diffusion.processor_diffusion import make_diffusion_pre_post_processors
 from lerobot.processor import (
+    OBS_EEF_POSE,
     DataProcessorPipeline,
     SE3RelativeActionsProcessorStep,
     absolute_to_relative_pose_actions,
@@ -183,3 +184,60 @@ def test_diffusion_preprocessor_with_relative_actions_survives_save_and_load():
     processed = loaded(batch)
     expected = absolute_to_relative_pose_actions(actions, state)
     torch.testing.assert_close(processed[ACTION], expected)
+
+
+def _rot6d_pose(state: torch.Tensor) -> torch.Tensor:
+    """[xyz, rot6d] of an [xyz, euler, ...] state."""
+    return torch.cat((state[..., :3], matrix_to_rotation_6d(euler_xyz_to_matrix(state[..., 3:6]))), dim=-1)
+
+
+def test_rot6d_reference_pose_gives_the_same_relative_actions_as_euler():
+    generator = torch.Generator().manual_seed(6)
+    state, actions = _random_state(3, generator), _random_actions(3, 4, generator, extra=1)
+    pose = _rot6d_pose(state)
+    expected = absolute_to_relative_pose_actions(actions, state)
+    relative = absolute_to_relative_pose_actions(actions, pose, pose_layout="rot6d")
+    torch.testing.assert_close(relative, expected)
+    torch.testing.assert_close(
+        relative_to_absolute_pose_actions(relative, pose, pose_layout="rot6d"), actions
+    )
+    # the Euler wrap-around at +-pi is the same rotation and the same 6D pose
+    wrapped = state.clone()
+    wrapped[..., 3] = torch.remainder(wrapped[..., 3], 2 * np.pi)
+    torch.testing.assert_close(_rot6d_pose(wrapped), pose)
+    with pytest.raises(ValueError, match="pose_layout"):
+        absolute_to_relative_pose_actions(actions, pose, pose_layout="quaternion")
+
+
+def test_step_reads_the_reference_pose_key_and_needs_it():
+    generator = torch.Generator().manual_seed(7)
+    state, actions = _random_state(2, generator), _random_actions(2, 4, generator)
+    pose = torch.stack((_rot6d_pose(_random_state(2, generator)), _rot6d_pose(state)), dim=1)  # (B, n_obs, 9)
+    step = SE3RelativeActionsProcessorStep(enabled=True, reference_pose_key=OBS_EEF_POSE)
+    # the state holds something else entirely (e.g. a relative proprioception): only the reference key is used
+    converted = step(create_transition({OBS_STATE: torch.zeros(2, 5), OBS_EEF_POSE: pose}, actions))
+    torch.testing.assert_close(converted[ACTION], absolute_to_relative_pose_actions(actions, state))
+    assert step.get_config() == {"enabled": True, "reference_pose_key": OBS_EEF_POSE}
+    with pytest.raises(KeyError, match=OBS_EEF_POSE):
+        step(create_transition({OBS_STATE: state}, actions))
+    assert (
+        step(create_transition({OBS_STATE: state}, None))[ACTION] is None
+    )  # inference: no action, no pose needed
+
+
+def test_diffusion_preprocessor_with_a_reference_pose_key_survives_save_and_load():
+    generator = torch.Generator().manual_seed(8)
+    state = torch.stack((_random_state(2, generator), _random_state(2, generator)), dim=1).float()
+    actions = _random_actions(2, 4, generator).float()
+    config = _diffusion_config(True)
+    config.relative_actions_reference_key = OBS_EEF_POSE
+    preprocessor, _ = make_diffusion_pre_post_processors(config)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        preprocessor.save_pretrained(tmpdir)
+        loaded = DataProcessorPipeline.from_pretrained(tmpdir, config_filename="policy_preprocessor.json")
+    batch = transition_to_batch(
+        create_transition({OBS_STATE: torch.zeros(2, 2, 7), OBS_EEF_POSE: _rot6d_pose(state)}, actions)
+    )
+    torch.testing.assert_close(loaded(batch)[ACTION], absolute_to_relative_pose_actions(actions, state))
+    with pytest.raises(ValueError, match="use_relative_actions"):
+        DiffusionConfig(relative_actions_reference_key=OBS_EEF_POSE)

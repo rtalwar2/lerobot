@@ -61,7 +61,15 @@ def make_diffusion_pre_post_processors(
     s = make_default_policy_processor_steps(config, dataset_stats)
     # use_relative_actions: absolute -> relative pose actions on the raw (unnormalized) state, before the
     # normalizer; only inserted when enabled, so the default pipeline (and saved checkpoints) are unchanged
-    relative_steps = [SE3RelativeActionsProcessorStep(enabled=True)] if config.use_relative_actions else []
+    relative_steps = (
+        [
+            SE3RelativeActionsProcessorStep(
+                enabled=True, reference_pose_key=config.relative_actions_reference_key
+            )
+        ]
+        if config.use_relative_actions
+        else []
+    )
     return make_policy_processor_pipelines(
         input_steps=[s.rename_observations, s.add_batch_dim, s.to_device, *relative_steps, s.normalize],
         output_steps=[s.unnormalize, s.to_cpu],

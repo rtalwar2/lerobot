@@ -98,6 +98,7 @@ from .relative_action_processor import (
 )
 from .rename_processor import RenameObservationsProcessorStep, rename_stats
 from .se3_relative_action_processor import (
+    OBS_EEF_POSE,
     SE3RelativeActionsProcessorStep,
     absolute_to_relative_pose_actions,
     relative_to_absolute_pose_actions,
@@ -183,6 +184,7 @@ __all__ = [
     "TruncatedProcessorStep",
     "to_absolute_actions",
     "to_relative_actions",
+    "OBS_EEF_POSE",
     "SE3RelativeActionsProcessorStep",
     "absolute_to_relative_pose_actions",
     "relative_to_absolute_pose_actions",
